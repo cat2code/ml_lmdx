@@ -29,7 +29,7 @@ def main():
 
     source = RootSource(path=str(root_path), tree_name="LDMX_Events")
     
-    try:
+    try: # Read rechits branches (events.root file)
         branch_type = "rechits_overlay"
         vectors = get_vector_branches("ecal", branch_type)
         branch_names = get_all_branch_names("ecal", branch_type)
@@ -44,7 +44,7 @@ def main():
             entry_start=args.start,
             entry_stop=args.stop,
         )
-    except:
+    except: # Read simhits branches instead (pileup.root file)
         print("Reading branch failed, looking for simhits branch instead...")
         branch_type = "simhits_pileup"
         vectors = get_vector_branches("ecal", branch_type)

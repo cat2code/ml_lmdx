@@ -9,6 +9,23 @@ Utilities for converting jagged ECal hit arrays into padded tensors.
 Current implementation is simple and readable, not yet optimized.
 """
 
+def tensorize_ecal_event(event):
+    """
+    Return:
+      x   : [N, F]
+      pos : [N, 3]
+    """
+    # Replace these keys with your actual event content
+    x_vals = event["x"].float()
+    y_vals = event["y"].float()
+    z_vals = event["z"].float()
+    e_vals = event["energy"].float()
+
+    pos = torch.stack([x_vals, y_vals, z_vals], dim=1)
+    x = torch.stack([x_vals, y_vals, z_vals, e_vals], dim=1)
+
+    return x, pos
+
 
 def ecal_hits_to_padded_tensor(arrays, vector_branches, max_hits=256):
     x = arrays[vector_branches["x"]]
