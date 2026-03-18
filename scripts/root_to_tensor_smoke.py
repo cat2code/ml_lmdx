@@ -28,20 +28,40 @@ def main():
         raise FileNotFoundError(f"ROOT file not found: {root_path}")
 
     source = RootSource(path=str(root_path), tree_name="LDMX_Events")
+    
+    try:
+        branch_type = "rechits_overlay"
+        vectors = get_vector_branches("ecal", branch_type)
+        branch_names = get_all_branch_names("ecal", branch_type)
 
-    vectors = get_vector_branches("ecal", "simhits_pileup")
-    branch_names = get_all_branch_names("ecal", "simhits_pileup")
+        print("Reading branches:")
+        for b in branch_names:
+            print("  ", b)
 
-    print("Reading branches:")
-    for b in branch_names:
-        print("  ", b)
+        arrays = read_branches(
+            source,
+            branch_names=branch_names,
+            entry_start=args.start,
+            entry_stop=args.stop,
+        )
+    except:
+        print("Reading branch failed, looking for simhits branch instead...")
+        branch_type = "simhits_pileup"
+        vectors = get_vector_branches("ecal", branch_type)
+        branch_names = get_all_branch_names("ecal", branch_type)
 
-    arrays = read_branches(
-        source,
-        branch_names=branch_names,
-        entry_start=args.start,
-        entry_stop=args.stop,
-    )
+        print("Reading branches:")
+        for b in branch_names:
+            print("  ", b)
+
+        arrays = read_branches(
+            source,
+            branch_names=branch_names,
+            entry_start=args.start,
+            entry_stop=args.stop,
+        )
+        
+        
 
     X, mask = ecal_hits_to_padded_tensor(arrays, vectors, max_hits=args.max_hits)
 

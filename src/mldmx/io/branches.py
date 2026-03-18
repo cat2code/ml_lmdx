@@ -8,7 +8,16 @@ BRANCHES = {
                 "z": "EcalSimHits_pileup/EcalSimHits_pileup.z_",
                 "energy": "EcalSimHits_pileup/EcalSimHits_pileup.edep_",
             },
-        }
+        },
+        "rechits_overlay": {
+            "scalars": [],
+            "vectors": {
+                "x": "EcalRecHits_overlay/EcalRecHits_overlay.xpos_",
+                "y": "EcalRecHits_overlay/EcalRecHits_overlay.ypos_",
+                "z": "EcalRecHits_overlay/EcalRecHits_overlay.zpos_",
+                "energy": "EcalRecHits_overlay/EcalRecHits_overlay.energy_",
+            },
+        },
     }
 }
 
