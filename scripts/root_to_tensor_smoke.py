@@ -34,32 +34,22 @@ def main():
         vectors = get_vector_branches("ecal", branch_type)
         branch_names = get_all_branch_names("ecal", branch_type)
 
-        print("Reading branches:")
-        for b in branch_names:
-            print("  ", b)
-
-        arrays = read_branches(
-            source,
-            branch_names=branch_names,
-            entry_start=args.start,
-            entry_stop=args.stop,
-        )
     except: # Read simhits branches instead (pileup.root file)
         print("Reading branch failed, looking for simhits branch instead...")
         branch_type = "simhits_pileup"
         vectors = get_vector_branches("ecal", branch_type)
         branch_names = get_all_branch_names("ecal", branch_type)
 
-        print("Reading branches:")
-        for b in branch_names:
-            print("  ", b)
+    print("Reading branches:")
+    for b in branch_names:
+        print("  ", b)
 
-        arrays = read_branches(
-            source,
-            branch_names=branch_names,
-            entry_start=args.start,
-            entry_stop=args.stop,
-        )
+    arrays = read_branches(
+        source,
+        branch_names=branch_names,
+        entry_start=args.start,
+        entry_stop=args.stop,
+    )
         
         
 
