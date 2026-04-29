@@ -13,6 +13,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from mldmx.datasets.ecal_tpad_dataset import ECalTriggerPadTensorDataset
 from mldmx.datasets.tensorize import tensorize_ecal_with_triggerpad_context
 from mldmx.io.root_reader import read_ecal_rechits_with_truth_and_triggerpad_context
 from mldmx.models import ECalHitTransformer
@@ -57,6 +58,12 @@ def parse_args():
         default=project_root / "data/28apr_00/events.root",
         type=Path,
     )
+    parser.add_argument(
+        "--processed-dir",
+        default=None,
+        type=Path,
+        help="Optional directory produced by preprocess_ecal_tpad_dataset.py.",
+    )
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--d-model", type=int, default=64)
     parser.add_argument("--nhead", type=int, default=4)
@@ -74,26 +81,28 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
-    project_root = Path(__file__).resolve().parents[1]
-    root_file = args.root_file.resolve()
-    model_path = project_root / "models/simple_3_class_ecal_tpad_transformer.pt"
-    pred_plot_path = project_root / "figures/simple_3_class_event9_tpad_transformer_predicted.png"
-    truth_plot_path = project_root / "figures/simple_3_class_event9_tpad_transformer_truth.png"
+def load_tensor_events(args):
+    if args.processed_dir is not None:
+        processed_dir = args.processed_dir.resolve()
+        print(f"Reading preprocessed dataset: {processed_dir}")
+        dataset = ECalTriggerPadTensorDataset(processed_dir)
+        tensor_events = [dataset[i] for i in range(len(dataset))]
+        print(f"number of events: {len(tensor_events)}")
+        for event in tensor_events:
+            event_idx = int(event["event_idx"])
+            print(
+                f"event {event_idx}: selected_ecal_hits={event['ecal_mask'].sum().item()}, "
+                f"tpad_nodes={event['tpad_mask'].sum().item()}, "
+                f"labels={sorted(set(event['physical_y'].tolist()))}"
+            )
+        return tensor_events
 
+    root_file = args.root_file.resolve()
     print(f"Reading ROOT file: {root_file}")
     events = read_ecal_rechits_with_truth_and_triggerpad_context(root_file, max_events=10)
-    if len(events) != 10:
-        raise ValueError(f"Expected exactly 10 events, found {len(events)}.")
     print(f"number of events: {len(events)}")
 
     filter_noise = not args.keep_noise
-    print(
-        "Noise handling: "
-        + ("filtering out noise hits before training/evaluation" if filter_noise else "keeping noise hits")
-    )
-
     tensor_events = []
     for event_idx, event in enumerate(events):
         n_noise = sum(bool(v) for v in event["noise_flag"])
@@ -109,6 +118,26 @@ def main():
             f"tpad_nodes={tensor_event['tpad_mask'].sum().item()}, "
             f"labels={sorted(set(tensor_event['physical_y'].tolist()))}"
         )
+
+    return tensor_events
+
+
+def main():
+    args = parse_args()
+    project_root = Path(__file__).resolve().parents[1]
+    model_path = project_root / "models/simple_3_class_ecal_tpad_transformer.pt"
+    pred_plot_path = project_root / "figures/simple_3_class_event9_tpad_transformer_predicted.png"
+    truth_plot_path = project_root / "figures/simple_3_class_event9_tpad_transformer_truth.png"
+
+    filter_noise = not args.keep_noise
+    print(
+        "Noise handling: "
+        + ("filtering out noise hits before training/evaluation" if filter_noise else "keeping noise hits")
+    )
+
+    tensor_events = load_tensor_events(args)
+    if len(tensor_events) < 10:
+        raise ValueError(f"Expected at least 10 events, found {len(tensor_events)}.")
 
     train_events = tensor_events[:9]
     test_event = tensor_events[9]

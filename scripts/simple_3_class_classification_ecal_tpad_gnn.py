@@ -15,6 +15,10 @@ import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 
+from mldmx.datasets.ecal_tpad_dataset import (
+    ECalTriggerPadTensorDataset,
+    tensor_event_to_pyg_data,
+)
 from mldmx.datasets.graph_builder import build_ecal_tpad_context_graph
 from mldmx.datasets.tensorize import tensorize_ecal_with_triggerpad_context
 from mldmx.io.root_reader import read_ecal_rechits_with_truth_and_triggerpad_context
@@ -77,6 +81,12 @@ def parse_args():
         default=project_root / "data/28apr_00/events.root",
         type=Path,
     )
+    parser.add_argument(
+        "--processed-dir",
+        default=None,
+        type=Path,
+        help="Optional directory produced by preprocess_ecal_tpad_dataset.py.",
+    )
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--hidden-dim", type=int, default=32)
     parser.add_argument("--k-ecal", type=int, default=8)
@@ -92,26 +102,34 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
-    project_root = Path(__file__).resolve().parents[1]
-    root_file = args.root_file.resolve()
-    model_path = project_root / "models/simple_3_class_ecal_tpad_gnn.pt"
-    pred_plot_path = project_root / "figures/simple_3_class_event9_tpad_gnn_predicted.png"
-    truth_plot_path = project_root / "figures/simple_3_class_event9_tpad_gnn_truth.png"
+def load_graphs(args):
+    if args.processed_dir is not None:
+        processed_dir = args.processed_dir.resolve()
+        print(f"Reading preprocessed dataset: {processed_dir}")
+        dataset = ECalTriggerPadTensorDataset(processed_dir)
+        graphs = [
+            tensor_event_to_pyg_data(
+                dataset[i],
+                k_ecal=args.k_ecal,
+                k_tpad_to_ecal=args.k_tpad_to_ecal,
+                use_precomputed_edges=True,
+            )
+            for i in range(len(dataset))
+        ]
+        print(f"number of events: {len(graphs)}")
+        for graph in graphs:
+            print(
+                f"event {int(graph.event_idx)}: selected_ecal_hits={graph.num_ecal}, "
+                f"tpad_nodes={graph.num_tpad}, labels={sorted(set(graph.physical_y.tolist()))}"
+            )
+        return graphs
 
+    root_file = args.root_file.resolve()
     print(f"Reading ROOT file: {root_file}")
     events = read_ecal_rechits_with_truth_and_triggerpad_context(root_file, max_events=10)
-    if len(events) != 10:
-        raise ValueError(f"Expected exactly 10 events, found {len(events)}.")
     print(f"number of events: {len(events)}")
 
     filter_noise = not args.keep_noise
-    print(
-        "Noise handling: "
-        + ("filtering out noise hits before training/evaluation" if filter_noise else "keeping noise hits")
-    )
-
     graphs = []
     for event_idx, event in enumerate(events):
         n_noise = sum(bool(v) for v in event["noise_flag"])
@@ -132,6 +150,26 @@ def main():
             f"event {event_idx}: selected_ecal_hits={graph.num_ecal}, "
             f"tpad_nodes={graph.num_tpad}, labels={sorted(set(graph.physical_y.tolist()))}"
         )
+
+    return graphs
+
+
+def main():
+    args = parse_args()
+    project_root = Path(__file__).resolve().parents[1]
+    model_path = project_root / "models/simple_3_class_ecal_tpad_gnn.pt"
+    pred_plot_path = project_root / "figures/simple_3_class_event9_tpad_gnn_predicted.png"
+    truth_plot_path = project_root / "figures/simple_3_class_event9_tpad_gnn_truth.png"
+
+    filter_noise = not args.keep_noise
+    print(
+        "Noise handling: "
+        + ("filtering out noise hits before training/evaluation" if filter_noise else "keeping noise hits")
+    )
+
+    graphs = load_graphs(args)
+    if len(graphs) < 10:
+        raise ValueError(f"Expected at least 10 events, found {len(graphs)}.")
 
     train_graphs = graphs[:9]
     test_graph = graphs[9]
