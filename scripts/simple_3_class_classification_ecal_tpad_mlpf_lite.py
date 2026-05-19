@@ -2,8 +2,7 @@
 Run from the mldmx directory:
 
     cd mldmx
-    python3 -m pip install -e .
-    python3 scripts/simple_3_class_classification_ecal_tpad_mlpf_lite.py
+    python3 -m pip install -e . ; python3 scripts/simple_3_class_classification_ecal_tpad_mlpf_lite.py
 """
 
 import argparse
@@ -106,7 +105,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--root-file",
-        default=project_root / "data/28apr_00/events.root",
+        default=project_root / "data/ldmx_overlay_events_700k/3e/events/events_1.root",
         type=Path,
     )
     parser.add_argument("--epochs", type=int, default=100)

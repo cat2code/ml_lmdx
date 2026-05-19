@@ -26,6 +26,34 @@ def read_branches(source: RootSource, branch_names, entry_start=0, entry_stop=No
     return arrays
 
 
+def _read_tree_arrays(tree, branch_names, entry_start=0, entry_stop=None, step_size=None):
+    if step_size is None:
+        yield tree.arrays(
+            branch_names,
+            entry_start=entry_start,
+            entry_stop=entry_stop,
+            library="ak",
+        )
+        return
+
+    yield from tree.iterate(
+        branch_names,
+        entry_start=entry_start,
+        entry_stop=entry_stop,
+        library="ak",
+        step_size=step_size,
+    )
+
+
+def _missing_branches(tree, branch_names):
+    available_branches = set(tree.keys())
+    return [
+        branch_name
+        for branch_name in branch_names
+        if branch_name not in available_branches
+    ]
+
+
 def has_branches(source: RootSource, branch_names) -> bool:
     with uproot.open(source.path) as f:
         tree = f[source.tree_name]
@@ -193,6 +221,81 @@ def read_ecal_rechits_with_truth(root_path, max_events=10):
     return events
 
 
+def _build_ecal_tpad_context_events(arrays, rechit_vectors, simhit_vectors, tpad_vectors):
+    num_events = len(arrays[rechit_vectors["id"]])
+
+    for iev in range(num_events):
+        simhit_ids = ak.to_list(arrays[simhit_vectors["id"]][iev])
+        simhit_truth_by_id = {}
+        for idx, hit_id in enumerate(simhit_ids):
+            hit_id = int(hit_id)
+            simhit_truth_by_id[hit_id] = {
+                "track_id_contribs": [
+                    int(v)
+                    for v in ak.to_list(
+                        arrays[simhit_vectors["track_id_contribs"]][iev][idx]
+                    )
+                ],
+                "edep_contribs": [
+                    float(v)
+                    for v in ak.to_list(
+                        arrays[simhit_vectors["edep_contribs"]][iev][idx]
+                    )
+                ],
+                "origin_id_contribs": [
+                    int(v)
+                    for v in ak.to_list(
+                        arrays[simhit_vectors["origin_id_contribs"]][iev][idx]
+                    )
+                ],
+                "n_contribs": int(arrays[simhit_vectors["n_contribs"]][iev][idx]),
+            }
+
+        hit_ids = [int(v) for v in ak.to_list(arrays[rechit_vectors["id"]][iev])]
+        event = {
+            "hit_id": hit_ids,
+            "x": [float(v) for v in ak.to_list(arrays[rechit_vectors["x"]][iev])],
+            "y": [float(v) for v in ak.to_list(arrays[rechit_vectors["y"]][iev])],
+            "z": [float(v) for v in ak.to_list(arrays[rechit_vectors["z"]][iev])],
+            "energy": [
+                float(v)
+                for v in ak.to_list(arrays[rechit_vectors["energy"]][iev])
+            ],
+            "noise_flag": [
+                bool(v)
+                for v in ak.to_list(arrays[rechit_vectors["noise_flag"]][iev])
+            ],
+            "track_id_contribs": [],
+            "edep_contribs": [],
+            "origin_id_contribs": [],
+            "n_contribs": [],
+            "trigger_pad_tracks": {
+                "centroid": [
+                    float(v)
+                    for v in ak.to_list(arrays[tpad_vectors["centroid"]][iev])
+                ],
+                "pe": [float(v) for v in ak.to_list(arrays[tpad_vectors["pe"]][iev])],
+            },
+        }
+
+        for hit_id in hit_ids:
+            truth = simhit_truth_by_id.get(
+                hit_id,
+                {
+                    "track_id_contribs": [],
+                    "edep_contribs": [],
+                    "origin_id_contribs": [],
+                    "n_contribs": 0,
+                },
+            )
+            event["track_id_contribs"].append(truth["track_id_contribs"])
+            event["edep_contribs"].append(truth["edep_contribs"])
+            event["origin_id_contribs"].append(truth["origin_id_contribs"])
+            event["n_contribs"].append(truth["n_contribs"])
+
+        yield event
+
+
 def read_trigger_pad_tracks(root_path, max_events=10):
     """
     Read TriggerPadTracks overlay context information.
@@ -252,16 +355,64 @@ def read_ecal_rechits_with_truth_and_triggerpad_context(root_path, max_events=10
     combined event shape explicitly.
     """
 
-    events = read_ecal_rechits_with_truth(root_path, max_events=max_events)
-    trigger_pad_events = read_trigger_pad_tracks(root_path, max_events=max_events)
-
-    if len(events) != len(trigger_pad_events):
-        raise ValueError(
-            f"ECal reader returned {len(events)} events but TriggerPadTracks reader "
-            f"returned {len(trigger_pad_events)} events."
+    return [
+        event
+        for _entry, event in iter_ecal_rechits_with_truth_and_triggerpad_context(
+            root_path,
+            max_events=max_events,
         )
+    ]
 
-    for event, trigger_pad_event in zip(events, trigger_pad_events):
-        event["trigger_pad_tracks"] = trigger_pad_event
 
-    return events
+def iter_ecal_rechits_with_truth_and_triggerpad_context(
+    root_path,
+    max_events=10,
+    step_size=None,
+):
+    """
+    Yield labelled ECal RecHits with TriggerPadTracks context from one ROOT file.
+
+    This reads all required ECal, truth, and TriggerPadTracks branches through one
+    tree handle. Passing step_size enables chunked uproot reads, which lets callers
+    show progress between chunks and caps peak memory for larger samples.
+    """
+
+    root_path = Path(root_path)
+    source = RootSource(path=str(root_path), tree_name="LDMX_Events")
+    rechit_vectors = get_vector_branches("ecal", "rechits_overlay")
+    simhit_vectors = get_vector_branches("ecal", "simhits_overlay")
+    tpad_vectors = get_vector_branches("trigger_pad_tracks", "overlay")
+    branch_names = (
+        list(rechit_vectors.values())
+        + list(simhit_vectors.values())
+        + list(tpad_vectors.values())
+    )
+
+    with uproot.open(source.path) as f:
+        tree = f[source.tree_name]
+        missing_branches = _missing_branches(tree, branch_names)
+        if missing_branches:
+            raise KeyError(f"Missing required ECal/TriggerPadTracks branches: {missing_branches}")
+
+        entry_stop = max_events
+        if max_events is not None:
+            entry_stop = min(int(max_events), int(tree.num_entries))
+
+        entry_offset = 0
+        for arrays in _read_tree_arrays(
+            tree,
+            branch_names=branch_names,
+            entry_start=0,
+            entry_stop=entry_stop,
+            step_size=step_size,
+        ):
+            for local_offset, event in enumerate(
+                _build_ecal_tpad_context_events(
+                    arrays,
+                    rechit_vectors=rechit_vectors,
+                    simhit_vectors=simhit_vectors,
+                    tpad_vectors=tpad_vectors,
+                )
+            ):
+                yield entry_offset + local_offset, event
+            entry_offset += len(arrays[rechit_vectors["id"]])
