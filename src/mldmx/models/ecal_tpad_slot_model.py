@@ -80,12 +80,17 @@ class ECalTpadSlotModel(nn.Module):
             nn.Linear(hidden_dim, self.num_classes),
         )
 
-        self.slot_queries = nn.Parameter(torch.randn(max_electrons, hidden_dim) * 0.02)
+        self.event_summary = nn.Sequential(
+            nn.Linear(2 * hidden_dim + 1, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
         self.slot_valid_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
+            nn.Linear(hidden_dim, max_electrons),
         )
         self.count_head = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
@@ -142,15 +147,19 @@ class ECalTpadSlotModel(nn.Module):
             h = h + self.type_embedding(node_type.to(device=x.device, dtype=torch.long).clamp(0, 1))
 
         encoded = self.encoder(h.unsqueeze(0)).squeeze(0)
-        event_repr = encoded.mean(dim=0)
+        mean_repr = encoded.mean(dim=0)
+        max_repr = encoded.max(dim=0).values
+        log_num_tokens = torch.log1p(
+            torch.tensor([encoded.shape[0]], dtype=encoded.dtype, device=encoded.device)
+        )
+        event_repr = self.event_summary(torch.cat([mean_repr, max_repr, log_num_tokens], dim=0))
 
         fraction_logits = self.fraction_head(encoded)
-        slot_repr = event_repr.unsqueeze(0) + self.slot_queries
         return {
             "origin_logits": self.origin_head(encoded),
             "fraction_logits": fraction_logits,
             "fraction_pred": torch.softmax(fraction_logits, dim=-1),
-            "slot_valid_logits": self.slot_valid_head(slot_repr).squeeze(-1),
+            "slot_valid_logits": self.slot_valid_head(event_repr),
             "count_logits": self.count_head(event_repr),
             "signal_logit": self.signal_head(event_repr).squeeze(-1),
         }

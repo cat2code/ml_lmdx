@@ -118,12 +118,19 @@ def compute_event_losses(model, event: dict, device: torch.device, args):
     ecal_fraction_logits = outputs["fraction_logits"][ecal_mask]
     ecal_fraction_pred = outputs["fraction_pred"][ecal_mask]
 
-    origin_loss = F.cross_entropy(ecal_origin_logits, origin_target)
+    origin_weight = getattr(args, "origin_class_weights", None)
+    if origin_weight is not None:
+        origin_weight = torch.as_tensor(origin_weight, dtype=torch.float32, device=device)
+    origin_loss = F.cross_entropy(ecal_origin_logits, origin_target, weight=origin_weight)
     fraction_loss = soft_label_cross_entropy(ecal_fraction_logits, fraction_target)
     slot_loss = F.binary_cross_entropy_with_logits(outputs["slot_valid_logits"], slot_target)
+    count_weight = getattr(args, "count_class_weights", None)
+    if count_weight is not None:
+        count_weight = torch.as_tensor(count_weight, dtype=torch.float32, device=device)
     count_loss = F.cross_entropy(
         outputs["count_logits"].unsqueeze(0),
         count_target.unsqueeze(0),
+        weight=count_weight,
     )
     total_loss = (
         args.lambda_origin * origin_loss

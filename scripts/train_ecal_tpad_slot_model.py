@@ -11,6 +11,7 @@ Example from the mldmx directory:
 """
 
 import argparse
+from collections import Counter
 import sys
 import time
 from pathlib import Path
@@ -24,7 +25,7 @@ if SRC_DIR.exists():
     sys.path.insert(0, str(SRC_DIR))
 
 from mldmx.datasets.ecal_tpad_dataset import ECalTriggerPadTensorDataset
-from mldmx.datasets.ecal_tpad_loading import load_ecal_tpad_tensor_events
+from mldmx.datasets.ecal_tpad_loading import canonical_axis_from_target_mode, load_ecal_tpad_tensor_events
 from mldmx.datasets.preprocess import normalize_continuous_features
 from mldmx.datasets.stats import count_classes, target_order_counts
 from mldmx.eval.ecal_tpad_slot_model import evaluate
@@ -81,10 +82,10 @@ def parse_args():
     parser.add_argument(
         "--target-mode",
         choices=("canonical-y", "canonical-x", "canonical-z", "physical-origin"),
-        default="physical-origin",
+        default="canonical-y",
         help=(
-            "physical-origin works for mixed 2e/3e samples. canonical-* currently expects all "
-            "requested labels to be present in every event."
+            "canonical-* maps the physical origin IDs present in each event into variable-count "
+            "slots ordered by the requested coordinate axis."
         ),
     )
     parser.add_argument("--hidden-dim", type=int, default=128)
@@ -95,13 +96,18 @@ def parse_args():
     parser.add_argument("--no-type-embedding", action="store_true")
     parser.add_argument("--lambda-origin", type=float, default=1.0)
     parser.add_argument("--lambda-fraction", type=float, default=1.0)
-    parser.add_argument("--lambda-slot", type=float, default=0.2)
-    parser.add_argument("--lambda-count", type=float, default=0.2)
+    parser.add_argument("--lambda-slot", type=float, default=0.5)
+    parser.add_argument("--lambda-count", type=float, default=1.0)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--lr-scheduler", choices=("none", "plateau"), default="none")
     parser.add_argument("--plateau-patience", type=int, default=3)
     parser.add_argument("--plateau-factor", type=float, default=0.5)
     parser.add_argument("--no-normalize-features", action="store_true")
+    parser.add_argument(
+        "--no-class-weights",
+        action="store_true",
+        help="Disable inverse-frequency weights for hit-origin and event-count CE losses.",
+    )
     parser.add_argument("--keep-noise", action="store_true")
     parser.add_argument("--no-progress", action="store_true")
     parser.add_argument(
@@ -173,6 +179,79 @@ def attach_root_source_metadata(event, source, global_event_idx: int, electron_c
     event["source_entry"] = int(source["entry"])
 
 
+def apply_variable_slot_target_mode(event: dict, valid_labels, target_mode: str, max_electrons: int):
+    axis = canonical_axis_from_target_mode(target_mode)
+    if axis is None:
+        event["target_class_names"] = [f"origin {label}" for label in valid_labels]
+        event["target_label_order"] = list(valid_labels)
+        return event
+
+    if "physical_y" not in event or "ecal_pos" not in event:
+        raise KeyError("Canonical slot target mode requires event['physical_y'] and event['ecal_pos'].")
+
+    original_physical_y = event.get("origin_id_y", event["physical_y"]).clone()
+    pos = event["ecal_pos"]
+    present_labels = sorted({int(label) for label in original_physical_y.tolist()})
+    if len(present_labels) > max_electrons:
+        raise ValueError(
+            f"Event has {len(present_labels)} origin labels, but max_electrons={max_electrons}."
+        )
+
+    label_means = []
+    for label in present_labels:
+        mask = original_physical_y == label
+        label_means.append((label, float(pos[mask, axis].mean().item())))
+    ordered_labels = [label for label, _mean in sorted(label_means, key=lambda item: (item[1], item[0]))]
+    label_to_slot = {label: slot_idx + 1 for slot_idx, label in enumerate(ordered_labels)}
+
+    event["origin_id_y"] = original_physical_y
+    event["y"] = torch.tensor(
+        [label_to_slot[int(label)] - 1 for label in original_physical_y.tolist()],
+        dtype=torch.long,
+    )
+    event["physical_y"] = event["y"] + 1
+    event["target_label_order"] = ordered_labels
+
+    if "fraction_target" in event:
+        original_fraction = event.get("origin_id_fraction_target", event["fraction_target"]).clone()
+        event["origin_id_fraction_target"] = original_fraction
+        if original_fraction.shape[1] == max_electrons + 1:
+            original_fraction = original_fraction[:, 1:]
+        if original_fraction.shape[1] != len(valid_labels):
+            raise ValueError(
+                f"Expected {len(valid_labels)} physical-origin fraction columns before canonicalization, "
+                f"got {original_fraction.shape[1]}."
+            )
+        physical_label_to_column = {label: idx for idx, label in enumerate(valid_labels)}
+        canonical_fraction = torch.zeros(
+            (original_fraction.shape[0], max_electrons),
+            dtype=original_fraction.dtype,
+            device=original_fraction.device,
+        )
+        for slot_idx, label in enumerate(ordered_labels):
+            source_col = physical_label_to_column.get(int(label))
+            if source_col is not None:
+                canonical_fraction[:, slot_idx] = original_fraction[:, source_col]
+        event["fraction_target"] = canonical_fraction
+
+    axis_name = {0: "x", 1: "y", 2: "z"}[axis]
+    event["target_class_names"] = [
+        f"slot {slot_idx + 1}: {axis_name}-rank {slot_idx + 1}"
+        for slot_idx in range(max_electrons)
+    ]
+    return event
+
+
+def apply_target_mode_to_events(events, args):
+    for event in events:
+        apply_variable_slot_target_mode(
+            event,
+            valid_labels=tuple(args.valid_labels),
+            target_mode=args.target_mode,
+            max_electrons=args.max_electrons,
+        )
+
+
 def load_balanced_root_events(args, data_root: Path, logger):
     root_specs = [
         (2, "2e", data_root / "2e/events"),
@@ -199,7 +278,7 @@ def load_balanced_root_events(args, data_root: Path, logger):
             root_files=root_files,
             max_events=args.events_per_class,
             valid_labels=tuple(args.valid_labels),
-            target_mode=args.target_mode,
+            target_mode="physical-origin",
             filter_noise=filter_noise,
             allow_fewer_events=args.allow_fewer_events,
             data_dir=data_dir,
@@ -308,6 +387,53 @@ def validate_args(args):
         raise ValueError(f"--valid-labels contains duplicates: {valid_labels}.")
 
 
+def inverse_frequency_weights(counts: dict[int, int], num_classes: int):
+    weights = [0.0] * num_classes
+    positive = {idx: count for idx, count in counts.items() if count > 0}
+    if not positive:
+        return [1.0] * num_classes
+    total = sum(positive.values())
+    for idx, count in positive.items():
+        if 0 <= idx < num_classes:
+            weights[idx] = total / (len(positive) * count)
+    nonzero = [value for value in weights if value > 0.0]
+    mean_nonzero = sum(nonzero) / len(nonzero)
+    return [value / mean_nonzero if value > 0.0 else 0.0 for value in weights]
+
+
+def add_class_weights_from_training_split(args, events, train_indices, logger):
+    if args.no_class_weights:
+        args.origin_class_weights = None
+        args.count_class_weights = None
+        return
+
+    origin_counts = Counter()
+    count_counts = Counter()
+    for idx in train_indices:
+        event = events[idx]
+        origin_counts.update(int(label) for label in event["physical_y"].tolist())
+        if "electron_count" in event:
+            value = event["electron_count"]
+            if isinstance(value, torch.Tensor):
+                value = int(value.detach().cpu().reshape(-1)[0].item())
+            else:
+                value = int(value)
+        else:
+            value = len({int(label) for label in event["physical_y"].tolist()})
+        count_counts.update([value])
+
+    args.origin_class_weights = inverse_frequency_weights(
+        origin_counts,
+        num_classes=args.max_electrons + 1,
+    )
+    args.count_class_weights = inverse_frequency_weights(
+        count_counts,
+        num_classes=args.max_electrons + 1,
+    )
+    logger.info("Origin CE class weights: %s", args.origin_class_weights)
+    logger.info("Count CE class weights: %s", args.count_class_weights)
+
+
 def save_event_count_plots(run_dir, predictions, args, stem="event_count_confusion_matrix"):
     if not predictions:
         return
@@ -397,9 +523,11 @@ def main():
         len(splits["test"]),
     )
     logger.info("Target mode: %s", args.target_mode)
+    apply_target_mode_to_events(events, args)
     logger.info("Training class counts: %s", count_classes(events, splits["train"]))
     logger.info("Validation class counts: %s", count_classes(events, splits["val"]))
     logger.info("Test class counts: %s", count_classes(events, splits["test"]))
+    add_class_weights_from_training_split(args, events, splits["train"], logger)
 
     feature_norm = None
     if not args.no_normalize_features:

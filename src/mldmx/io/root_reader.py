@@ -54,6 +54,61 @@ def _missing_branches(tree, branch_names):
     ]
 
 
+def _branch_events(arrays, branch_name):
+    return ak.to_list(arrays[branch_name])
+
+
+def _int_list(values):
+    return [int(value) for value in values]
+
+
+def _float_list(values):
+    return [float(value) for value in values]
+
+
+def _bool_list(values):
+    return [bool(value) for value in values]
+
+
+def _nested_int_lists(rows):
+    return [_int_list(row) for row in rows]
+
+
+def _nested_float_lists(rows):
+    return [_float_list(row) for row in rows]
+
+
+def _aligned_truth_by_rechit_id(
+    hit_ids,
+    simhit_ids,
+    track_id_rows,
+    edep_rows,
+    origin_id_rows,
+    n_contribs,
+):
+    simhit_index_by_id = {int(hit_id): idx for idx, hit_id in enumerate(simhit_ids)}
+    track_id_contribs = []
+    edep_contribs = []
+    origin_id_contribs = []
+    aligned_n_contribs = []
+
+    for hit_id in hit_ids:
+        simhit_idx = simhit_index_by_id.get(int(hit_id))
+        if simhit_idx is None:
+            track_id_contribs.append([])
+            edep_contribs.append([])
+            origin_id_contribs.append([])
+            aligned_n_contribs.append(0)
+            continue
+
+        track_id_contribs.append(track_id_rows[simhit_idx])
+        edep_contribs.append(edep_rows[simhit_idx])
+        origin_id_contribs.append(origin_id_rows[simhit_idx])
+        aligned_n_contribs.append(int(n_contribs[simhit_idx]))
+
+    return track_id_contribs, edep_contribs, origin_id_contribs, aligned_n_contribs
+
+
 def has_branches(source: RootSource, branch_names) -> bool:
     with uproot.open(source.path) as f:
         tree = f[source.tree_name]
@@ -172,49 +227,52 @@ def read_ecal_rechits_with_truth(root_path, max_events=10):
         entry_stop=max_events,
     )
 
-    num_events = len(arrays[rechit_vectors["id"]])
+    rechit_ids_by_event = _branch_events(arrays, rechit_vectors["id"])
+    rechit_x_by_event = _branch_events(arrays, rechit_vectors["x"])
+    rechit_y_by_event = _branch_events(arrays, rechit_vectors["y"])
+    rechit_z_by_event = _branch_events(arrays, rechit_vectors["z"])
+    rechit_energy_by_event = _branch_events(arrays, rechit_vectors["energy"])
+    rechit_noise_by_event = _branch_events(arrays, rechit_vectors["noise_flag"])
+    simhit_ids_by_event = _branch_events(arrays, simhit_vectors["id"])
+    simhit_track_rows_by_event = _branch_events(
+        arrays,
+        simhit_vectors["track_id_contribs"],
+    )
+    simhit_edep_rows_by_event = _branch_events(
+        arrays,
+        simhit_vectors["edep_contribs"],
+    )
+    simhit_origin_rows_by_event = _branch_events(
+        arrays,
+        simhit_vectors["origin_id_contribs"],
+    )
+    simhit_n_contribs_by_event = _branch_events(arrays, simhit_vectors["n_contribs"])
+
+    num_events = len(rechit_ids_by_event)
     events = []
 
     for iev in range(num_events):
-        simhit_ids = ak.to_list(arrays[simhit_vectors["id"]][iev])
-        simhit_truth_by_id = {}
-        for idx, hit_id in enumerate(simhit_ids):
-            hit_id = int(hit_id)
-            simhit_truth_by_id[hit_id] = {
-                "track_id_contribs": [int(v) for v in ak.to_list(arrays[simhit_vectors["track_id_contribs"]][iev][idx])],
-                "edep_contribs": [float(v) for v in ak.to_list(arrays[simhit_vectors["edep_contribs"]][iev][idx])],
-                "origin_id_contribs": [int(v) for v in ak.to_list(arrays[simhit_vectors["origin_id_contribs"]][iev][idx])],
-                "n_contribs": int(arrays[simhit_vectors["n_contribs"]][iev][idx]),
-            }
-
-        hit_ids = [int(v) for v in ak.to_list(arrays[rechit_vectors["id"]][iev])]
+        hit_ids = _int_list(rechit_ids_by_event[iev])
+        track_id_rows, edep_rows, origin_id_rows, n_contribs = _aligned_truth_by_rechit_id(
+            hit_ids,
+            simhit_ids_by_event[iev],
+            _nested_int_lists(simhit_track_rows_by_event[iev]),
+            _nested_float_lists(simhit_edep_rows_by_event[iev]),
+            _nested_int_lists(simhit_origin_rows_by_event[iev]),
+            simhit_n_contribs_by_event[iev],
+        )
         event = {
             "hit_id": hit_ids,
-            "x": [float(v) for v in ak.to_list(arrays[rechit_vectors["x"]][iev])],
-            "y": [float(v) for v in ak.to_list(arrays[rechit_vectors["y"]][iev])],
-            "z": [float(v) for v in ak.to_list(arrays[rechit_vectors["z"]][iev])],
-            "energy": [float(v) for v in ak.to_list(arrays[rechit_vectors["energy"]][iev])],
-            "noise_flag": [bool(v) for v in ak.to_list(arrays[rechit_vectors["noise_flag"]][iev])],
-            "track_id_contribs": [],
-            "edep_contribs": [],
-            "origin_id_contribs": [],
-            "n_contribs": [],
+            "x": _float_list(rechit_x_by_event[iev]),
+            "y": _float_list(rechit_y_by_event[iev]),
+            "z": _float_list(rechit_z_by_event[iev]),
+            "energy": _float_list(rechit_energy_by_event[iev]),
+            "noise_flag": _bool_list(rechit_noise_by_event[iev]),
+            "track_id_contribs": track_id_rows,
+            "edep_contribs": edep_rows,
+            "origin_id_contribs": origin_id_rows,
+            "n_contribs": n_contribs,
         }
-
-        for hit_id in hit_ids:
-            truth = simhit_truth_by_id.get(
-                hit_id,
-                {
-                    "track_id_contribs": [],
-                    "edep_contribs": [],
-                    "origin_id_contribs": [],
-                    "n_contribs": 0,
-                },
-            )
-            event["track_id_contribs"].append(truth["track_id_contribs"])
-            event["edep_contribs"].append(truth["edep_contribs"])
-            event["origin_id_contribs"].append(truth["origin_id_contribs"])
-            event["n_contribs"].append(truth["n_contribs"])
 
         events.append(event)
 
@@ -222,76 +280,56 @@ def read_ecal_rechits_with_truth(root_path, max_events=10):
 
 
 def _build_ecal_tpad_context_events(arrays, rechit_vectors, simhit_vectors, tpad_vectors):
-    num_events = len(arrays[rechit_vectors["id"]])
+    rechit_ids_by_event = _branch_events(arrays, rechit_vectors["id"])
+    rechit_x_by_event = _branch_events(arrays, rechit_vectors["x"])
+    rechit_y_by_event = _branch_events(arrays, rechit_vectors["y"])
+    rechit_z_by_event = _branch_events(arrays, rechit_vectors["z"])
+    rechit_energy_by_event = _branch_events(arrays, rechit_vectors["energy"])
+    rechit_noise_by_event = _branch_events(arrays, rechit_vectors["noise_flag"])
+    simhit_ids_by_event = _branch_events(arrays, simhit_vectors["id"])
+    simhit_track_rows_by_event = _branch_events(
+        arrays,
+        simhit_vectors["track_id_contribs"],
+    )
+    simhit_edep_rows_by_event = _branch_events(
+        arrays,
+        simhit_vectors["edep_contribs"],
+    )
+    simhit_origin_rows_by_event = _branch_events(
+        arrays,
+        simhit_vectors["origin_id_contribs"],
+    )
+    simhit_n_contribs_by_event = _branch_events(arrays, simhit_vectors["n_contribs"])
+    tpad_centroid_by_event = _branch_events(arrays, tpad_vectors["centroid"])
+    tpad_pe_by_event = _branch_events(arrays, tpad_vectors["pe"])
 
+    num_events = len(rechit_ids_by_event)
     for iev in range(num_events):
-        simhit_ids = ak.to_list(arrays[simhit_vectors["id"]][iev])
-        simhit_truth_by_id = {}
-        for idx, hit_id in enumerate(simhit_ids):
-            hit_id = int(hit_id)
-            simhit_truth_by_id[hit_id] = {
-                "track_id_contribs": [
-                    int(v)
-                    for v in ak.to_list(
-                        arrays[simhit_vectors["track_id_contribs"]][iev][idx]
-                    )
-                ],
-                "edep_contribs": [
-                    float(v)
-                    for v in ak.to_list(
-                        arrays[simhit_vectors["edep_contribs"]][iev][idx]
-                    )
-                ],
-                "origin_id_contribs": [
-                    int(v)
-                    for v in ak.to_list(
-                        arrays[simhit_vectors["origin_id_contribs"]][iev][idx]
-                    )
-                ],
-                "n_contribs": int(arrays[simhit_vectors["n_contribs"]][iev][idx]),
-            }
-
-        hit_ids = [int(v) for v in ak.to_list(arrays[rechit_vectors["id"]][iev])]
+        hit_ids = _int_list(rechit_ids_by_event[iev])
+        track_id_rows, edep_rows, origin_id_rows, n_contribs = _aligned_truth_by_rechit_id(
+            hit_ids,
+            simhit_ids_by_event[iev],
+            _nested_int_lists(simhit_track_rows_by_event[iev]),
+            _nested_float_lists(simhit_edep_rows_by_event[iev]),
+            _nested_int_lists(simhit_origin_rows_by_event[iev]),
+            simhit_n_contribs_by_event[iev],
+        )
         event = {
             "hit_id": hit_ids,
-            "x": [float(v) for v in ak.to_list(arrays[rechit_vectors["x"]][iev])],
-            "y": [float(v) for v in ak.to_list(arrays[rechit_vectors["y"]][iev])],
-            "z": [float(v) for v in ak.to_list(arrays[rechit_vectors["z"]][iev])],
-            "energy": [
-                float(v)
-                for v in ak.to_list(arrays[rechit_vectors["energy"]][iev])
-            ],
-            "noise_flag": [
-                bool(v)
-                for v in ak.to_list(arrays[rechit_vectors["noise_flag"]][iev])
-            ],
-            "track_id_contribs": [],
-            "edep_contribs": [],
-            "origin_id_contribs": [],
-            "n_contribs": [],
+            "x": _float_list(rechit_x_by_event[iev]),
+            "y": _float_list(rechit_y_by_event[iev]),
+            "z": _float_list(rechit_z_by_event[iev]),
+            "energy": _float_list(rechit_energy_by_event[iev]),
+            "noise_flag": _bool_list(rechit_noise_by_event[iev]),
+            "track_id_contribs": track_id_rows,
+            "edep_contribs": edep_rows,
+            "origin_id_contribs": origin_id_rows,
+            "n_contribs": n_contribs,
             "trigger_pad_tracks": {
-                "centroid": [
-                    float(v)
-                    for v in ak.to_list(arrays[tpad_vectors["centroid"]][iev])
-                ],
-                "pe": [float(v) for v in ak.to_list(arrays[tpad_vectors["pe"]][iev])],
+                "centroid": _float_list(tpad_centroid_by_event[iev]),
+                "pe": _float_list(tpad_pe_by_event[iev]),
             },
         }
-
-        for hit_id in hit_ids:
-            truth = simhit_truth_by_id.get(
-                hit_id,
-                {
-                    "track_id_contribs": [],
-                    "edep_contribs": [],
-                    "origin_id_contribs": [],
-                    "n_contribs": 0,
-                },
-            )
-            event["track_id_contribs"].append(truth["track_id_contribs"])
-            event["edep_contribs"].append(truth["edep_contribs"])
-            event["origin_id_contribs"].append(truth["origin_id_contribs"])
-            event["n_contribs"].append(truth["n_contribs"])
 
         yield event
 

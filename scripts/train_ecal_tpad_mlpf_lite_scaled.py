@@ -13,6 +13,8 @@ Example from the mldmx directory:
 """
 
 import argparse
+import hashlib
+import json
 import sys
 import time
 from pathlib import Path
@@ -24,6 +26,11 @@ SRC_DIR = PROJECT_ROOT / "src"
 if SRC_DIR.exists():
     sys.path.insert(0, str(SRC_DIR))
 
+from mldmx.datasets.ecal_tpad_dataset import (
+    ECalTriggerPadTensorDataset,
+    save_tensor_event,
+    write_manifest,
+)
 from mldmx.datasets.ecal_tpad_loading import load_ecal_tpad_tensor_events
 from mldmx.datasets.preprocess import normalize_continuous_features
 from mldmx.datasets.stats import count_classes, target_order_counts
@@ -45,6 +52,8 @@ from mldmx.viz.training import plot_confusion_matrix, plot_history, plot_test_fr
 
 VALID_LABELS = (1, 2, 3)
 DEFAULT_DATA_DIR = Path("data/ldmx_overlay_events_700k/3e/events")
+DEFAULT_PROCESSED_DIR = PROJECT_ROOT / "data/processed/ecal_tpad_mlpf_lite_scaled"
+CACHE_SCHEMA_VERSION = 1
 
 
 def parse_args():
@@ -53,6 +62,20 @@ def parse_args():
     )
     parser.add_argument("--max-events", type=int, default=1000)
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR)
+    parser.add_argument(
+        "--processed-dir",
+        type=Path,
+        default=DEFAULT_PROCESSED_DIR,
+        help=(
+            "Directory used for cached tensorized events. A config-specific subdirectory "
+            "is created and reused when its manifest matches the requested ROOT inputs."
+        ),
+    )
+    parser.add_argument(
+        "--force-preprocess",
+        action="store_true",
+        help="Rebuild the tensor cache even if a matching manifest already exists.",
+    )
     parser.add_argument(
         "--output-dir",
         type=Path,
@@ -119,10 +142,145 @@ def parse_args():
     return parser.parse_args()
 
 
+def _json_ready(value):
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, tuple):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, list):
+        return [_json_ready(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _json_ready(item) for key, item in value.items()}
+    return value
+
+
+def _root_file_metadata(root_files):
+    metadata = []
+    for path in root_files:
+        stat = path.stat()
+        metadata.append(
+            {
+                "path": str(path.resolve()),
+                "name": path.name,
+                "size": int(stat.st_size),
+                "mtime_ns": int(stat.st_mtime_ns),
+            }
+        )
+    return metadata
+
+
+def tensor_cache_spec(args, data_dir, root_files):
+    filter_noise = not args.keep_noise
+    payload = {
+        "schema_version": CACHE_SCHEMA_VERSION,
+        "reader": "ecal_tpad_mlpf_lite_scaled",
+        "data_dir": str(data_dir.resolve()),
+        "root_files": _root_file_metadata(root_files),
+        "max_events": int(args.max_events),
+        "valid_labels": [int(label) for label in args.valid_labels],
+        "target_mode": args.target_mode,
+        "filter_noise": bool(filter_noise),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    signature = hashlib.sha256(encoded).hexdigest()[:16]
+    return payload, signature
+
+
+def resolve_processed_cache_dir(args, data_dir, root_files):
+    processed_root = args.processed_dir
+    if not processed_root.is_absolute():
+        processed_root = PROJECT_ROOT / processed_root
+    spec, signature = tensor_cache_spec(args, data_dir, root_files)
+    return processed_root / f"cache_{signature}", spec, signature
+
+
+def _manifest_matches_cache(manifest, spec, signature):
+    return (
+        manifest.get("cache_signature") == signature
+        and manifest.get("cache_spec") == spec
+        and bool(manifest.get("event_files"))
+    )
+
+
+def has_matching_tensor_cache(cache_dir, spec, signature):
+    manifest_path = cache_dir / "manifest.json"
+    if not manifest_path.exists():
+        return False
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return False
+    if not _manifest_matches_cache(manifest, spec, signature):
+        return False
+    return all((cache_dir / name).exists() for name in manifest["event_files"])
+
+
+def load_cached_tensor_events(cache_dir, logger):
+    dataset = ECalTriggerPadTensorDataset(cache_dir)
+    events = []
+    for dataset_idx in range(len(dataset)):
+        event = dict(dataset[dataset_idx])
+        if "event_idx" not in event:
+            event["event_idx"] = torch.tensor(dataset_idx, dtype=torch.long)
+        events.append(event)
+
+    event_sources = dataset.metadata.get("event_sources", [])
+    if not event_sources:
+        event_sources = [
+            {
+                "event_idx": idx,
+                "file": dataset.event_files[idx].name,
+                "entry": idx,
+                "source": "processed",
+            }
+            for idx in range(len(dataset))
+        ]
+    logger.info("Loaded %s tensorized events from cache: %s", len(events), cache_dir)
+    return events, event_sources
+
+
+def write_tensor_cache(cache_dir, events, event_sources, spec, signature, elapsed_sec, logger):
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    event_files = []
+    for event_idx, event in enumerate(events):
+        event_files.append(save_tensor_event(event, cache_dir, event_idx))
+
+    metadata = {
+        "cache_schema_version": CACHE_SCHEMA_VERSION,
+        "cache_signature": signature,
+        "cache_spec": spec,
+        "num_events": len(event_files),
+        "event_sources": _json_ready(event_sources),
+        "preprocess_elapsed_sec": float(elapsed_sec),
+        "feature_layout": [
+            "is_ecal",
+            "is_tpad",
+            "ecal_x",
+            "ecal_y",
+            "ecal_z",
+            "ecal_energy",
+            "tpad_centroid",
+            "tpad_pe",
+        ],
+    }
+    manifest_path = write_manifest(cache_dir, metadata=metadata, event_files=event_files)
+    logger.info("Wrote tensor cache manifest: %s", manifest_path)
+
+
 def load_tensor_events(args, data_dir, root_files, logger):
+    cache_dir, spec, signature = resolve_processed_cache_dir(args, data_dir, root_files)
+    if not args.force_preprocess and has_matching_tensor_cache(cache_dir, spec, signature):
+        logger.info("Using matching tensor cache signature %s", signature)
+        return load_cached_tensor_events(cache_dir, logger), cache_dir
+
     filter_noise = not args.keep_noise
     read_step_size = args.read_step_size if args.read_step_size > 0 else None
-    return load_ecal_tpad_tensor_events(
+    if args.force_preprocess:
+        logger.info("Force preprocessing requested; rebuilding tensor cache in %s", cache_dir)
+    else:
+        logger.info("No matching tensor cache found; preprocessing ROOT events into %s", cache_dir)
+    preprocess_start = time.perf_counter()
+    events, event_sources = load_ecal_tpad_tensor_events(
         root_files=root_files,
         max_events=args.max_events,
         valid_labels=tuple(args.valid_labels),
@@ -136,6 +294,23 @@ def load_tensor_events(args, data_dir, root_files, logger):
         event_log_every=args.event_log_every,
         read_step_size=read_step_size,
     )
+    preprocess_elapsed = time.perf_counter() - preprocess_start
+    logger.info(
+        "Preprocessed %s events in %.2f seconds (%.3f sec/event)",
+        len(events),
+        preprocess_elapsed,
+        preprocess_elapsed / max(len(events), 1),
+    )
+    write_tensor_cache(
+        cache_dir,
+        events,
+        event_sources,
+        spec=spec,
+        signature=signature,
+        elapsed_sec=preprocess_elapsed,
+        logger=logger,
+    )
+    return (events, event_sources), cache_dir
 
 
 @torch.no_grad()
@@ -226,7 +401,8 @@ def main():
     device = resolve_device(args.device, logger)
     logger.info("Using device: %s", device)
 
-    events, event_sources = load_tensor_events(args, data_dir, root_files, logger)
+    (events, event_sources), processed_cache_dir = load_tensor_events(args, data_dir, root_files, logger)
+    args.resolved_processed_cache_dir = processed_cache_dir
     splits = deterministic_split(len(events), args.seed)
     logger.info(
         "Split sizes: train=%s val=%s test=%s",
