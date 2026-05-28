@@ -18,6 +18,8 @@ if SRC_DIR.exists():
 
 from mldmx.datasets.ecal_tpad_loading import (
     apply_variable_count_target_mode,
+    filter_noise_tensor_event,
+    load_multi_sharded_tensor_events,
     load_processed_or_grouped_root_tensor_events,
 )
 from mldmx.datasets.model_views import (
@@ -49,13 +51,56 @@ def parse_args():
         description="Validate maintained model forwards and backwards from one canonical event."
     )
     parser.add_argument("--processed-dir", type=Path, default=DEFAULT_PROCESSED_DIR)
+    parser.add_argument("--processed-cache-root", type=Path, default=None)
+    parser.add_argument(
+        "--processed-source",
+        action="append",
+        nargs=3,
+        metavar=("ELECTRON_COUNT", "LABEL", "CACHE_DIR"),
+        help="Add one existing sharded cache source.",
+    )
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     parser.add_argument("--event-index", type=int, default=0)
+    parser.add_argument("--events-per-source", type=int, default=None)
+    parser.add_argument("--device", choices=("cpu", "cuda", "mps"), default="cpu")
     parser.add_argument("--seed", type=int, default=7)
     return parser.parse_args()
 
 
+def resolve_project_path(path):
+    path = Path(path)
+    if path.is_absolute() or path.exists():
+        return path
+    return PROJECT_ROOT / path
+
+
+def processed_sources_from_args(args):
+    if args.processed_cache_root is not None:
+        root = resolve_project_path(args.processed_cache_root)
+        return [
+            (2, "2e", root / "2e/events"),
+            (3, "3e", root / "3e/events"),
+        ]
+    return [
+        (int(electron_count), label, resolve_project_path(cache_dir))
+        for electron_count, label, cache_dir in (args.processed_source or [])
+    ]
+
+
 def load_validation_event(args):
+    if args.processed_cache_root is not None or args.processed_source is not None:
+        logger = logging.getLogger("model-family-validation")
+        events, _sources, selected_source, _root_files = load_multi_sharded_tensor_events(
+            processed_sources_from_args(args),
+            events_per_source=args.events_per_source,
+            logger=logger,
+        )
+        if args.event_index >= len(events):
+            raise ValueError(
+                f"Requested event index {args.event_index}, but only loaded {len(events)} event(s)."
+            )
+        return events[args.event_index], Path("multi-source-sharded-cache"), False
+
     processed_dir = resolve_existing_path(args.processed_dir, project_root=PROJECT_ROOT)
     data_root = resolve_existing_path(args.data_root, project_root=PROJECT_ROOT)
     root_specs = [
@@ -91,7 +136,11 @@ def processed_noise_filter_setting(processed_dir):
         return json.load(handle).get("filter_noise")
 
 
-def report_noise_handling(source_path, loaded_from_root):
+def report_noise_handling(source_path, loaded_from_root, raw_event):
+    if "is_noise_target" in raw_event:
+        count = int(raw_event["is_noise_target"].sum().item())
+        print(f"noise_hits: stored={count}; filtered before common five-model validation")
+        return
     filter_noise = True if loaded_from_root else processed_noise_filter_setting(source_path)
     if filter_noise is True:
         print("noise_hits: excluded (filter_noise=true); noise/background training is not validated")
@@ -110,11 +159,12 @@ def validate_provenance(event, original_physical_y):
         raise AssertionError("event['origin_id_y'] does not preserve the pre-canonical physical origins.")
 
 
-def run_baseline(name, model, view):
+def run_baseline(name, model, view, device):
+    model = model.to(device)
     model.train()
-    logits = model(view["x"].to(dtype=torch.float32))
-    supervised_logits = logits[view["ecal_mask"]]
-    target = view["y"].to(dtype=torch.long)
+    logits = model(view["x"].to(device=device, dtype=torch.float32))
+    supervised_logits = logits[view["ecal_mask"].to(device=device)]
+    target = view["y"].to(device=device, dtype=torch.long)
     if supervised_logits.shape != (target.shape[0], len(VALID_LABELS)):
         raise AssertionError(
             f"{name}: expected supervised logits {(target.shape[0], len(VALID_LABELS))}, "
@@ -129,7 +179,7 @@ def run_baseline(name, model, view):
     return tuple(view["x"].shape), tuple(supervised_logits.shape), float(loss.detach().item())
 
 
-def run_slot_model(event):
+def run_slot_model(event, device):
     view = ecal_tpad_slot_model_view(event)
     model = ECalTpadSlotModel(
         in_dim=int(view["x"].shape[1]),
@@ -139,7 +189,7 @@ def run_slot_model(event):
         max_electrons=len(VALID_LABELS),
         dropout=0.0,
         use_type_embedding=True,
-    ).cpu()
+    ).to(device)
     loss_args = SimpleNamespace(
         lambda_origin=1.0,
         lambda_fraction=1.0,
@@ -148,7 +198,7 @@ def run_slot_model(event):
         origin_class_weights=None,
         count_class_weights=None,
     )
-    losses = compute_slot_event_losses(model, view, torch.device("cpu"), loss_args)
+    losses = compute_slot_event_losses(model, view, device, loss_args)
     for key in ("total_loss", "origin_loss", "fraction_loss", "slot_loss", "count_loss"):
         if not bool(torch.isfinite(losses[key]).item()):
             raise AssertionError(f"ECalTpadSlotModel: {key} is not finite.")
@@ -163,9 +213,13 @@ def main():
     args = parse_args()
     if args.event_index < 0:
         raise ValueError("--event-index must be non-negative.")
+    if args.device == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("--device cuda requested, but torch.cuda.is_available() is false.")
+    device = torch.device(args.device)
     torch.manual_seed(args.seed)
 
-    event, source_path, loaded_from_root = load_validation_event(args)
+    raw_event, source_path, loaded_from_root = load_validation_event(args)
+    event = filter_noise_tensor_event(raw_event)
     original_physical_y = event["physical_y"].clone()
     apply_variable_count_target_mode(
         event,
@@ -176,7 +230,8 @@ def main():
     validate_provenance(event, original_physical_y)
 
     print(f"source: {source_path}")
-    report_noise_handling(source_path, loaded_from_root)
+    print(f"device: {device}")
+    report_noise_handling(source_path, loaded_from_root, raw_event)
     print(
         f"provenance: present origin_id_y={sorted(set(event['origin_id_y'].tolist()))} "
         f"canonical_order={event['target_label_order']}"
@@ -194,7 +249,7 @@ def main():
                 propagate_dimensions=16,
                 k=8,
                 dropout=0.0,
-            ).cpu(),
+            ),
             ecal_gravnet_view(event),
         ),
         (
@@ -208,7 +263,7 @@ def main():
                 propagate_dimensions=16,
                 k=8,
                 dropout=0.0,
-            ).cpu(),
+            ),
             ecal_tpad_gravnet_view(event),
         ),
         (
@@ -221,7 +276,7 @@ def main():
                 dim_feedforward=64,
                 dropout=0.0,
                 out_dim=3,
-            ).cpu(),
+            ),
             ecal_transformer_view(event),
         ),
         (
@@ -234,15 +289,15 @@ def main():
                 dim_feedforward=64,
                 dropout=0.0,
                 out_dim=3,
-            ).cpu(),
+            ),
             ecal_tpad_transformer_view(event),
         ),
     ]
     results = [
-        (name, *run_baseline(name, model, view))
+        (name, *run_baseline(name, model, view, device))
         for name, model, view in baseline_checks
     ]
-    results.append(("ECalTpadSlotModel", *run_slot_model(event)))
+    results.append(("ECalTpadSlotModel", *run_slot_model(event, device)))
 
     print(f"{'model':<21} {'input':<12} {'supervised output':<19} {'target mode':<12} {'loss':<10} status")
     for name, input_shape, output_shape, loss in results:

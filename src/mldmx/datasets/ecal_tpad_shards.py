@@ -505,3 +505,98 @@ class ShardedECalTpadDataset(Dataset):
                 group = [group[idx] for idx in order]
             ordered.extend(group)
         return ordered
+
+
+class MultiShardedECalTpadDataset(Dataset):
+    """Lazy view over multiple independent sharded caches."""
+
+    def __init__(self, sources, max_events=None, event_transform=None):
+        if not sources:
+            raise ValueError("MultiShardedECalTpadDataset requires at least one source.")
+        self.sources = list(sources)
+        self.event_transform = event_transform
+        self.offsets = []
+        total = 0
+        for source in self.sources:
+            self.offsets.append(total)
+            total += len(source["dataset"])
+        self.num_events = total if max_events is None else min(int(max_events), total)
+
+    def __len__(self):
+        return self.num_events
+
+    @property
+    def root_files(self):
+        files = []
+        for source in self.sources:
+            files.extend(source["dataset"].root_files)
+        return files
+
+    @property
+    def source_files(self):
+        files = []
+        for source in self.sources:
+            files.extend(source["dataset"].source_files)
+        return files
+
+    @property
+    def source_summaries(self):
+        return [
+            {
+                "electron_count": source["electron_count"],
+                "source_label": source["source_label"],
+                "cache_dir": str(source["cache_dir"]),
+                "num_events": len(source["dataset"]),
+            }
+            for source in self.sources
+        ]
+
+    def set_event_transform(self, event_transform):
+        self.event_transform = event_transform
+
+    def _source_idx_for_event(self, index):
+        if index < 0:
+            index += len(self)
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        return bisect_right(self.offsets, index) - 1
+
+    def __getitem__(self, index):
+        index = int(index)
+        if index < 0:
+            index += len(self)
+        source_idx = self._source_idx_for_event(index)
+        source = self.sources[source_idx]
+        local_index = index - self.offsets[source_idx]
+        event = dict(source["dataset"][local_index])
+        if source["electron_count"] is not None:
+            event["electron_count"] = torch.tensor(int(source["electron_count"]), dtype=torch.long)
+        event["source_label"] = source["source_label"]
+        if self.event_transform is not None:
+            event = self.event_transform(event)
+        return event
+
+    def order_indices_for_access(self, indices, seed=None):
+        grouped = {}
+        for index in indices:
+            source_idx = self._source_idx_for_event(int(index))
+            grouped.setdefault(source_idx, []).append(int(index))
+        source_indices = list(grouped)
+        generator = torch.Generator()
+        if seed is not None:
+            generator.manual_seed(int(seed))
+            order = torch.randperm(len(source_indices), generator=generator).tolist()
+            source_indices = [source_indices[idx] for idx in order]
+        else:
+            source_indices.sort()
+
+        ordered = []
+        for source_idx in source_indices:
+            group = grouped[source_idx]
+            local_group = [index - self.offsets[source_idx] for index in group]
+            local_order = self.sources[source_idx]["dataset"].order_indices_for_access(
+                local_group,
+                seed=None if seed is None else int(seed) + source_idx + 1,
+            )
+            ordered.extend(self.offsets[source_idx] + local_index for local_index in local_order)
+        return ordered

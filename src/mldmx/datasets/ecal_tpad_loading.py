@@ -9,6 +9,7 @@ from mldmx.datasets.tensorize import (
 )
 from mldmx.datasets.ecal_tpad_dataset import ECalTriggerPadTensorDataset
 from mldmx.datasets.ecal_tpad_shards import (
+    MultiShardedECalTpadDataset,
     ShardedECalTpadDataset,
     has_sharded_tensor_cache,
     prepare_sharded_tensor_cache,
@@ -353,8 +354,51 @@ def load_or_create_sharded_tensor_events(
     if mismatches:
         raise ValueError(
             f"Existing sharded cache target/filter settings do not match requested training: {mismatches}."
-        )
+    )
     return dataset, dataset, processed_cache, dataset.root_files
+
+
+def load_multi_sharded_tensor_events(
+    processed_sources,
+    max_events=None,
+    events_per_source=None,
+    shard_cache_size=1,
+    allow_incomplete_cache=False,
+    logger=None,
+):
+    """Load multiple existing sharded caches as one lazy event dataset."""
+    logger = logger or logging.getLogger(__name__)
+    sources = []
+    for electron_count, source_label, cache_dir in processed_sources:
+        cache_dir = Path(cache_dir)
+        dataset = ShardedECalTpadDataset(
+            cache_dir,
+            max_events=events_per_source,
+            shard_cache_size=shard_cache_size,
+            allow_incomplete=allow_incomplete_cache,
+        )
+        sources.append(
+            {
+                "electron_count": int(electron_count),
+                "source_label": source_label,
+                "cache_dir": cache_dir,
+                "dataset": dataset,
+            }
+        )
+        logger.info(
+            "Using sharded source %s (%se): %s event(s) from %s",
+            source_label,
+            electron_count,
+            len(dataset),
+            cache_dir,
+        )
+    combined = MultiShardedECalTpadDataset(sources, max_events=max_events)
+    logger.info(
+        "Loaded lazy multi-source sharded dataset with %s total event(s): %s",
+        len(combined),
+        combined.source_summaries,
+    )
+    return combined, combined, [source["cache_dir"] for source in sources], combined.root_files
 
 
 def attach_root_source_metadata(event, source, global_event_idx, electron_count=None, source_label=None):

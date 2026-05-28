@@ -19,9 +19,10 @@ from mldmx.datasets.ecal_tpad_loading import (
     apply_variable_count_target_mode_to_events,
     filter_noise_tensor_event,
     load_or_create_sharded_tensor_events,
+    load_multi_sharded_tensor_events,
     load_processed_or_grouped_root_tensor_events,
 )
-from mldmx.datasets.ecal_tpad_shards import ShardedECalTpadDataset
+from mldmx.datasets.ecal_tpad_shards import MultiShardedECalTpadDataset, ShardedECalTpadDataset
 from mldmx.datasets.model_views import (
     ecal_gravnet_view,
     ecal_tpad_gravnet_view,
@@ -70,6 +71,25 @@ def parse_args():
         type=Path,
         default=None,
         help="ML-ready sharded cache to reuse or create from --data-root (one ROOT file per shard).",
+    )
+    parser.add_argument(
+        "--processed-cache-root",
+        type=Path,
+        default=None,
+        help="Directory containing separate 2e/events and 3e/events sharded caches.",
+    )
+    parser.add_argument(
+        "--processed-source",
+        action="append",
+        nargs=3,
+        metavar=("ELECTRON_COUNT", "LABEL", "CACHE_DIR"),
+        help="Add one existing sharded cache source, e.g. --processed-source 2 2e data/.../2e/events.",
+    )
+    parser.add_argument(
+        "--events-per-source",
+        type=int,
+        default=None,
+        help="Balanced limit per processed source for multi-source sharded caches; total is sources times this value.",
     )
     parser.add_argument("--force-sharded-cache", action="store_true", help="Rebuild requested sharded cache files.")
     parser.add_argument(
@@ -135,7 +155,7 @@ def validate_args(args):
         raise ValueError("--events-per-class, --epochs, and --batch-size must be positive.")
     if args.max_events is not None and args.max_events <= 0:
         raise ValueError("--max-events must be positive when provided.")
-    for name in ("max_cache_root_files", "max_events_per_root_file", "shard_cache_size"):
+    for name in ("max_cache_root_files", "max_events_per_root_file", "shard_cache_size", "events_per_source"):
         value = getattr(args, name)
         if value is not None and value <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive when provided.")
@@ -145,6 +165,31 @@ def validate_args(args):
         raise ValueError("--valid-labels must contain at least two distinct origin labels.")
     if args.hidden_dim % args.num_heads != 0 and "Transformer" in args.model:
         raise ValueError("--hidden-dim must be divisible by --num-heads for transformer models.")
+    selected_processed_modes = sum(
+        value is not None for value in (args.processed_cache, args.processed_cache_root, args.processed_source)
+    )
+    if selected_processed_modes > 1:
+        raise ValueError("Use only one of --processed-cache, --processed-cache-root, or --processed-source.")
+
+
+def resolve_project_path(path):
+    path = Path(path)
+    if path.is_absolute() or path.exists():
+        return path
+    return PROJECT_ROOT / path
+
+
+def processed_sources_from_args(args):
+    if args.processed_cache_root is not None:
+        root = resolve_project_path(args.processed_cache_root)
+        return [
+            (2, "2e", root / "2e/events"),
+            (3, "3e", root / "3e/events"),
+        ]
+    return [
+        (int(electron_count), label, resolve_project_path(cache_dir))
+        for electron_count, label, cache_dir in (args.processed_source or [])
+    ]
 
 
 def load_events(args, logger):
@@ -154,6 +199,19 @@ def load_events(args, logger):
         (3, "3e", data_root / "3e/events"),
     ]
     read_step_size = args.read_step_size if args.read_step_size > 0 else None
+    if args.processed_cache_root is not None or args.processed_source is not None:
+        processed_sources = processed_sources_from_args(args)
+        logger.info(
+            "Multi-source sharded cache mode selected; use --events-per-source for balanced staged runs."
+        )
+        return load_multi_sharded_tensor_events(
+            processed_sources=processed_sources,
+            max_events=args.max_events,
+            events_per_source=args.events_per_source,
+            shard_cache_size=args.shard_cache_size,
+            allow_incomplete_cache=args.allow_incomplete_sharded_cache,
+            logger=logger,
+        )
     if args.processed_cache is not None:
         processed_cache = args.processed_cache
         if not processed_cache.is_absolute():
@@ -194,7 +252,7 @@ def load_events(args, logger):
         event_log_every=args.event_log_every,
         read_step_size=read_step_size,
     )
-    if isinstance(events, ShardedECalTpadDataset):
+    if isinstance(events, (ShardedECalTpadDataset, MultiShardedECalTpadDataset)):
         logger.info("Training lazily from ML-ready processed shards: %s", data_dir)
     elif not root_files:
         manifest_path = Path(data_dir) / "manifest.json"
@@ -218,7 +276,7 @@ def load_events(args, logger):
 
 
 def prepare_targets_and_features(events, splits, args, logger):
-    if isinstance(events, ShardedECalTpadDataset):
+    if isinstance(events, (ShardedECalTpadDataset, MultiShardedECalTpadDataset)):
         def target_transform(event):
             event = filter_noise_tensor_event(event)
             return apply_variable_count_target_mode(
@@ -377,7 +435,7 @@ def main():
     training_view_fn = view_fn
     logger.info("Input feature dimension: %s", input_dim)
     if args.cache_model_views:
-        if isinstance(events, ShardedECalTpadDataset):
+        if isinstance(events, (ShardedECalTpadDataset, MultiShardedECalTpadDataset)):
             logger.warning("--cache-model-views materializes selected sharded events in RAM.")
         training_events = [view_fn(event) for event in events]
         training_view_fn = None

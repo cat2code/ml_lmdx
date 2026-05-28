@@ -256,28 +256,26 @@ targets by default. Use `--filter-noise` only to deliberately write a
 noise-discarding cache.
 
 The current trainer interface can consume one sharded cache corresponding to
-its configured training dataset directly. A temporary combined-cache path is
-therefore still required for mixed `2e`/`3e` maintained training until the
-multi-cache dataset wrapper is added:
+its configured training dataset directly, or a root directory containing
+separate `2e/events` and `3e/events` caches:
 
 ```powershell
 python scripts/train_hit_classifier_baseline.py `
   --model ECalTpadTransformer `
-  --processed-cache data/processed/ecal_tpad_2e3e_sharded `
+  --processed-cache-root data/processed/production_5M_001_sharded `
+  --events-per-source 500 `
   --epochs 20 `
   --device cuda
 ```
 
-With `--processed-cache`, training reads events lazily from shards, retains
-only a small recent-shard cache in RAM, and uses shard-aware deterministic
-iteration. It does not use `--events-per-class`; the cache represents its
-selected ROOT files. `--max-events` can restrict the consumed events.
-If cache creation was interrupted and a short trial should use only its
-already completed valid shards, add `--allow-incomplete-sharded-cache`.
-Without this explicit flag, a trainer resumes creation of the missing shards.
-Training over separate `2e` and `3e` caches together requires the next
-multi-cache dataset-wrapper extension; the cache storage itself should remain
-separate.
+With `--processed-cache-root`, the trainer lazily combines independent
+`2e/events` and `3e/events` sharded caches without loading all shards into RAM.
+`--events-per-source` is a balanced limit, so `500` means 1,000 total events
+for the standard two-source layout. With `--processed-cache`, training reads a
+single sharded cache lazily. In both modes `--events-per-class` is ignored; the
+processed cache defines the available dataset. `--max-events` can restrict the
+total consumed events, but `--events-per-source` is preferred for balanced
+staged runs.
 
 On a SLURM cluster, submit the generic preprocessing job once per independent
 source dataset:
@@ -295,6 +293,25 @@ python scripts/smoke_ecal_tpad_sharded_cache.py --device cpu --max-root-files 2 
 
 The one-event-per-file processed format remains supported for existing small
 datasets and prototype outputs.
+
+## Cosmos GPU Training
+
+Cosmos-specific launch notes live in `docs/cosmos_training.md`. The short
+version is:
+
+```bash
+cd /projects/hep/fs9/shared/ldmx/users/eliotmp/mpetren-msceng-ldmx
+git pull
+source .venv/bin/activate
+cd mldmx
+python -m pip install -e .
+mkdir -p outputs/slurm
+sbatch other/cosmos_validate_gpu.sbatch
+sbatch --export=ALL,MODEL=ECalTpadTransformer,EVENTS_PER_SOURCE=500,EPOCHS=5,RUN_NAME=tpad_transformer_1k other/cosmos_train_baseline.sbatch
+```
+
+For the production cache layout, `--events-per-source 500` means 1,000 total
+events across the separate `2e` and `3e` processed shard sources.
 
 For a minimal ROOT-to-tensor inspection path:
 

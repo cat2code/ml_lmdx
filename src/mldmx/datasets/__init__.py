@@ -14,11 +14,13 @@ from mldmx.datasets.ecal_tpad_loading import (
     has_processed_tensor_events,
     load_ecal_tpad_tensor_events,
     load_grouped_root_tensor_events,
+    load_multi_sharded_tensor_events,
     load_processed_or_grouped_root_tensor_events,
     load_processed_tensor_events,
     load_or_create_sharded_tensor_events,
 )
 from mldmx.datasets.ecal_tpad_shards import (
+    MultiShardedECalTpadDataset,
     ShardedECalTpadDataset,
     has_sharded_tensor_cache,
     prepare_sharded_tensor_cache,
@@ -42,6 +44,7 @@ from mldmx.datasets.model_views import (
 
 __all__ = [
     "ECalTriggerPadTensorDataset",
+    "MultiShardedECalTpadDataset",
     "ShardedECalTpadDataset",
     "apply_target_mode",
     "apply_variable_count_target_mode",
@@ -58,6 +61,7 @@ __all__ = [
     "has_processed_tensor_events",
     "load_ecal_tpad_tensor_events",
     "load_grouped_root_tensor_events",
+    "load_multi_sharded_tensor_events",
     "load_processed_or_grouped_root_tensor_events",
     "load_processed_tensor_events",
     "load_or_create_sharded_tensor_events",
