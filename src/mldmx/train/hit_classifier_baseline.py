@@ -6,6 +6,11 @@ import torch
 import torch.nn.functional as F
 
 from mldmx.train.batching import chunks
+from mldmx.train.hit_classifier_batching import (
+    collate_hit_classifier_batch,
+    event_views_from_indices,
+    hit_classifier_batch_kind,
+)
 from mldmx.train.metrics import confusion_matrix_from_class_indices
 from mldmx.train.progress import make_progress
 
@@ -32,6 +37,37 @@ def compute_event_losses(model, event_or_view, view_fn, device):
         "true_class": target,
         "num_hits": target.numel(),
         "view": view,
+    }
+
+
+def compute_batch_losses(model, views, batch_kind, device):
+    """Compute one true model batch for supported hit-classifier architectures."""
+    batch = collate_hit_classifier_batch(views, batch_kind).to(device)
+    if batch.kind == "padded":
+        logits = model(batch.x, key_padding_mask=~batch.valid_mask)
+    elif batch.kind == "graph":
+        logits = model(batch.x, batch=batch.batch_index)
+    else:
+        raise ValueError(f"Unsupported hit-classifier batch kind: {batch.kind!r}.")
+
+    supervised_logits = logits[batch.supervised_mask]
+    target = batch.target[batch.supervised_mask]
+    if supervised_logits.shape[0] != target.shape[0]:
+        raise ValueError(
+            "Batched supervised logits and targets are not aligned: "
+            f"{supervised_logits.shape[0]} vs {target.shape[0]}."
+        )
+    if target.numel() == 0:
+        raise ValueError("Cannot train/evaluate a hit-classifier batch with no supervised ECal hits.")
+
+    loss = F.cross_entropy(supervised_logits, target)
+    pred_class = supervised_logits.argmax(dim=1)
+    return {
+        "total_loss": loss,
+        "pred_class": pred_class,
+        "true_class": target,
+        "num_hits": target.numel(),
+        "batch": batch,
     }
 
 
@@ -69,6 +105,7 @@ def finalize_metrics(totals, prefix=""):
 
 def train_one_epoch(model, events, train_indices, view_fn, optimizer, args, device, epoch, logger):
     model.train()
+    batch_kind = hit_classifier_batch_kind(model)
     if hasattr(events, "order_indices_for_access"):
         shuffled_indices = events.order_indices_for_access(train_indices, seed=args.seed + epoch)
     else:
@@ -90,16 +127,21 @@ def train_one_epoch(model, events, train_indices, view_fn, optimizer, args, devi
 
     for batch in progress:
         optimizer.zero_grad(set_to_none=True)
-        batch_loss_sum = None
-        batch_hits = 0
-        for event_idx in batch:
-            losses = compute_event_losses(model, events[event_idx], view_fn, device)
+        if batch_kind is None:
+            batch_loss_sum = None
+            batch_hits = 0
+            for event_idx in batch:
+                losses = compute_event_losses(model, events[event_idx], view_fn, device)
+                update_metric_totals(totals, losses)
+                weighted_loss = losses["total_loss"] * losses["num_hits"]
+                batch_loss_sum = weighted_loss if batch_loss_sum is None else batch_loss_sum + weighted_loss
+                batch_hits += int(losses["num_hits"])
+            batch_loss = batch_loss_sum / max(1, batch_hits)
+        else:
+            views = event_views_from_indices(events, batch, view_fn)
+            losses = compute_batch_losses(model, views, batch_kind, device)
             update_metric_totals(totals, losses)
-            weighted_loss = losses["total_loss"] * losses["num_hits"]
-            batch_loss_sum = weighted_loss if batch_loss_sum is None else batch_loss_sum + weighted_loss
-            batch_hits += int(losses["num_hits"])
-
-        batch_loss = batch_loss_sum / max(1, batch_hits)
+            batch_loss = losses["total_loss"]
         batch_loss.backward()
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)

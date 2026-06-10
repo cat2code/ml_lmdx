@@ -42,23 +42,42 @@ class _TransformerHitClassifier(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.head = nn.Linear(d_model, out_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Return origin-class logits for every input token.
 
         Args:
-            x: One event token sequence with shape ``[N_tokens, in_dim]``.
+            x: One event ``[N_tokens, in_dim]`` or a padded batch
+                ``[B, max_tokens, in_dim]``.
+            key_padding_mask: Optional bool mask with shape ``[B, max_tokens]``
+                where True entries are padding tokens ignored by attention.
         """
-        if x.ndim != 2 or x.shape[1] != self.in_dim:
+        if x.ndim not in (2, 3) or x.shape[-1] != self.in_dim:
             raise ValueError(
-                f"Expected x with shape [N_tokens, {self.in_dim}], got {tuple(x.shape)}."
+                f"Expected x with shape [N_tokens, {self.in_dim}] or "
+                f"[B, N_tokens, {self.in_dim}], got {tuple(x.shape)}."
             )
-        if x.shape[0] == 0:
-            raise ValueError("Expected at least one token, got an empty tensor.")
+        if x.shape[-2] == 0:
+            raise ValueError("Expected at least one token per transformer batch.")
 
-        h = self.input_proj(x).unsqueeze(0)
-        h = self.encoder(h).squeeze(0)
-        return self.head(h)
+        single_event = x.ndim == 2
+        if single_event:
+            x = x.unsqueeze(0)
+            if key_padding_mask is not None and key_padding_mask.ndim == 1:
+                key_padding_mask = key_padding_mask.unsqueeze(0)
+        if key_padding_mask is not None:
+            expected_mask_shape = x.shape[:2]
+            if key_padding_mask.shape != expected_mask_shape:
+                raise ValueError(
+                    f"Expected key_padding_mask with shape {tuple(expected_mask_shape)}, "
+                    f"got {tuple(key_padding_mask.shape)}."
+                )
+            key_padding_mask = key_padding_mask.to(device=x.device, dtype=torch.bool)
+
+        h = self.input_proj(x)
+        h = self.encoder(h, src_key_padding_mask=key_padding_mask)
+        logits = self.head(h)
+        return logits.squeeze(0) if single_event else logits
 
 
 class ECalTransformer(_TransformerHitClassifier):

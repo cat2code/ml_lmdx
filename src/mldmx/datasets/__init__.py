@@ -1,3 +1,4 @@
+from mldmx.datasets.cached_views import CachedEventViewDataset
 from mldmx.datasets.ecal_tpad_dataset import (
     ECalTriggerPadTensorDataset,
     save_tensor_event,
@@ -43,6 +44,7 @@ from mldmx.datasets.model_views import (
 )
 
 __all__ = [
+    "CachedEventViewDataset",
     "ECalTriggerPadTensorDataset",
     "MultiShardedECalTpadDataset",
     "ShardedECalTpadDataset",

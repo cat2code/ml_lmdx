@@ -354,7 +354,8 @@ def load_or_create_sharded_tensor_events(
     if mismatches:
         raise ValueError(
             f"Existing sharded cache target/filter settings do not match requested training: {mismatches}."
-    )
+        )
+    logger.info("Shard cache configuration: %s", dataset.cache_info())
     return dataset, dataset, processed_cache, dataset.root_files
 
 
@@ -398,6 +399,7 @@ def load_multi_sharded_tensor_events(
         len(combined),
         combined.source_summaries,
     )
+    logger.info("Shard cache configuration: %s", combined.cache_info())
     return combined, combined, [source["cache_dir"] for source in sources], combined.root_files
 
 
@@ -623,10 +625,30 @@ def load_processed_or_grouped_root_tensor_events(
     disable_progress=False,
     event_log_every=0,
     read_step_size=500,
+    shard_cache_size=1,
+    allow_incomplete_sharded_cache=False,
 ):
-    """Select an existing processed canonical dataset or build events from ROOT groups."""
+    """
+    Select an existing processed canonical dataset or build events from ROOT groups.
+
+    Sharded processed caches are preferred when ``processed_dir`` contains both
+    shard metadata and legacy ``event_*.pt`` files. This keeps local per-event
+    smoke datasets working while making the scalable path the default for large
+    processed directories.
+    """
     logger = logger or logging.getLogger(__name__)
     processed_dir = Path(processed_dir)
+    if has_sharded_tensor_cache(processed_dir):
+        logger.info("Using sharded processed tensor dataset: %s", processed_dir)
+        dataset = ShardedECalTpadDataset(
+            processed_dir,
+            max_events=max_processed_events,
+            shard_cache_size=shard_cache_size,
+            allow_incomplete=allow_incomplete_sharded_cache,
+        )
+        logger.info("Shard cache configuration: %s", dataset.cache_info())
+        return dataset, dataset, processed_dir, dataset.root_files
+
     if has_processed_tensor_events(processed_dir):
         if supervise_noise:
             raise ValueError(

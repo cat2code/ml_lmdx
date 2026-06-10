@@ -127,6 +127,7 @@ def build_run_overview(
     target_order_counts_by_split,
     view_fn,
     training_view_fn,
+    view_cache_info,
     start_epoch,
     best_val_loss,
 ):
@@ -181,6 +182,11 @@ def build_run_overview(
             "split_sizes": {name: len(indices) for name, indices in splits.items()},
             "class_counts": _jsonable(class_counts_by_split),
             "target_order_counts": _jsonable(target_order_counts_by_split),
+            "cache": (
+                _jsonable(event_sources.cache_info())
+                if hasattr(event_sources, "cache_info")
+                else None
+            ),
         },
         "preprocessing": {
             "target_mode": args.target_mode,
@@ -193,6 +199,7 @@ def build_run_overview(
                 if training_view_fn is None
                 else getattr(training_view_fn, "__name__", str(training_view_fn))
             ),
+            "model_view_cache": _jsonable(view_cache_info),
         },
         "hyperparameters": _jsonable(vars(args)),
     }
@@ -260,6 +267,7 @@ def render_run_overview_markdown(overview):
         f"- Resolved data dir: `{data['resolved_data_dir']}`",
         f"- Loaded events: `{data['num_loaded_events']}`",
         f"- Split sizes: `{json.dumps(data['split_sizes'], sort_keys=True)}`",
+        f"- Shard cache: `{json.dumps(data['cache'], sort_keys=True)}`",
         "",
         "### Class counts",
         "```json",
@@ -277,6 +285,7 @@ def render_run_overview_markdown(overview):
         f"- Normalize features: `{preprocessing['normalize_features']}`",
         f"- View function: `{preprocessing['view_fn']}`",
         f"- Training view function: `{preprocessing['training_view_fn']}`",
+        f"- Model-view cache: `{json.dumps(preprocessing['model_view_cache'], sort_keys=True)}`",
         "",
         "### Feature normalization",
         "```json",
@@ -369,4 +378,6 @@ def log_run_overview(logger, overview, artifact_paths):
         data["split_sizes"],
         data["resolved_data_dir"],
     )
+    logger.info("Data cache overview: %s", data["cache"])
+    logger.info("Model-view cache overview: %s", overview["preprocessing"]["model_view_cache"])
     logger.info("All run hyperparameters:\n%s", hyperparameter_lines)

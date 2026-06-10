@@ -439,6 +439,9 @@ class ShardedECalTpadDataset(Dataset):
         self.shard_cache_size = int(shard_cache_size)
         self.event_transform = event_transform
         self._loaded_shards = OrderedDict()
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._cache_evictions = 0
 
     def __len__(self):
         return self.num_events
@@ -451,8 +454,52 @@ class ShardedECalTpadDataset(Dataset):
     def source_files(self):
         return [entry["source"]["name"] for entry in self.shards]
 
+    @property
+    def shard_event_counts(self):
+        """Event counts for shards that are reachable under this dataset's max-event limit."""
+        remaining = self.num_events
+        counts = []
+        for entry in self.shards:
+            if remaining <= 0:
+                break
+            count = min(int(entry["num_events"]), remaining)
+            counts.append(count)
+            remaining -= count
+        return counts
+
     def set_event_transform(self, event_transform):
         self.event_transform = event_transform
+
+    def set_shard_cache_size(self, shard_cache_size):
+        """Resize the in-memory shard LRU without changing dataset contents."""
+        if shard_cache_size <= 0:
+            raise ValueError("shard_cache_size must be positive.")
+        self.shard_cache_size = int(shard_cache_size)
+        while len(self._loaded_shards) > self.shard_cache_size:
+            self._loaded_shards.popitem(last=False)
+            self._cache_evictions += 1
+
+    def clear_cache(self):
+        """Drop loaded shard payloads; useful before memory-sensitive phases."""
+        self._loaded_shards.clear()
+
+    def cache_info(self):
+        """Return lightweight shard-LRU telemetry for logs and run overviews."""
+        return {
+            "kind": "sharded",
+            "cache_dir": str(self.cache_dir),
+            "num_events": int(self.num_events),
+            "num_shards": len(self.shards),
+            "shard_cache_size": int(self.shard_cache_size),
+            "loaded_shards": list(self._loaded_shards.keys()),
+            "loaded_shard_paths": [
+                self.shards[shard_idx]["path"] for shard_idx in self._loaded_shards
+            ],
+            "cache_hits": int(self._cache_hits),
+            "cache_misses": int(self._cache_misses),
+            "cache_evictions": int(self._cache_evictions),
+            "shard_event_counts": self.shard_event_counts,
+        }
 
     def _shard_idx_for_event(self, index):
         if index < 0:
@@ -463,13 +510,16 @@ class ShardedECalTpadDataset(Dataset):
 
     def _load_shard(self, shard_idx):
         if shard_idx in self._loaded_shards:
+            self._cache_hits += 1
             payload = self._loaded_shards.pop(shard_idx)
             self._loaded_shards[shard_idx] = payload
             return payload
+        self._cache_misses += 1
         payload = _load_torch(self.cache_dir / self.shards[shard_idx]["path"])
         self._loaded_shards[shard_idx] = payload
         while len(self._loaded_shards) > self.shard_cache_size:
             self._loaded_shards.popitem(last=False)
+            self._cache_evictions += 1
         return payload
 
     def __getitem__(self, index):
@@ -551,8 +601,49 @@ class MultiShardedECalTpadDataset(Dataset):
             for source in self.sources
         ]
 
+    @property
+    def shard_event_counts(self):
+        counts = []
+        for source in self.sources:
+            counts.extend(source["dataset"].shard_event_counts)
+        return counts
+
     def set_event_transform(self, event_transform):
         self.event_transform = event_transform
+
+    def set_shard_cache_size(self, shard_cache_size):
+        """Resize each source dataset's shard LRU."""
+        for source in self.sources:
+            source["dataset"].set_shard_cache_size(shard_cache_size)
+
+    def clear_cache(self):
+        """Drop loaded shard payloads from every source dataset."""
+        for source in self.sources:
+            source["dataset"].clear_cache()
+
+    def cache_info(self):
+        """Return cache telemetry for the combined lazy sharded dataset."""
+        source_infos = []
+        for source in self.sources:
+            info = source["dataset"].cache_info()
+            info.update(
+                {
+                    "electron_count": source["electron_count"],
+                    "source_label": source["source_label"],
+                    "source_cache_dir": str(source["cache_dir"]),
+                }
+            )
+            source_infos.append(info)
+        return {
+            "kind": "multi_sharded",
+            "num_events": int(self.num_events),
+            "num_sources": len(self.sources),
+            "sources": source_infos,
+            "cache_hits": sum(info["cache_hits"] for info in source_infos),
+            "cache_misses": sum(info["cache_misses"] for info in source_infos),
+            "cache_evictions": sum(info["cache_evictions"] for info in source_infos),
+            "shard_event_counts": self.shard_event_counts,
+        }
 
     def _source_idx_for_event(self, index):
         if index < 0:

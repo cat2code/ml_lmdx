@@ -14,6 +14,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if SRC_DIR.exists():
     sys.path.insert(0, str(SRC_DIR))
 
+from mldmx.datasets.cached_views import CachedEventViewDataset
 from mldmx.datasets.ecal_tpad_loading import (
     apply_variable_count_target_mode,
     apply_variable_count_target_mode_to_events,
@@ -70,18 +71,32 @@ def parse_args():
     parser.add_argument("--events-per-class", type=int, default=10)
     parser.add_argument("--max-events", type=int, default=None, help="Optional limit for processed datasets.")
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
-    parser.add_argument("--processed-dir", type=Path, default=DEFAULT_PROCESSED_DIR)
+    parser.add_argument(
+        "--processed-dir",
+        type=Path,
+        default=DEFAULT_PROCESSED_DIR,
+        help=(
+            "Existing processed dataset. If the directory has sharded manifest/index files, "
+            "it is loaded lazily as shards; otherwise legacy event_*.pt files are loaded."
+        ),
+    )
     parser.add_argument(
         "--processed-cache",
         type=Path,
         default=None,
-        help="ML-ready sharded cache to reuse or create from --data-root (one ROOT file per shard).",
+        help=(
+            "ML-ready sharded cache to reuse or create from --data-root "
+            "(one ROOT file per shard; recommended for large training runs)."
+        ),
     )
     parser.add_argument(
         "--processed-cache-root",
         type=Path,
         default=None,
-        help="Directory containing separate 2e/events and 3e/events sharded caches.",
+        help=(
+            "Directory containing separate 2e/events and 3e/events sharded caches; "
+            "recommended for production jobs prepared by scripts/slurm."
+        ),
     )
     parser.add_argument(
         "--processed-source",
@@ -104,7 +119,15 @@ def parse_args():
     )
     parser.add_argument("--max-cache-root-files", type=int, default=None, help="Limit ROOT files per source when creating a smoke cache.")
     parser.add_argument("--max-events-per-root-file", type=int, default=None, help="Limit events per ROOT shard when creating a smoke cache.")
-    parser.add_argument("--shard-cache-size", type=int, default=1, help="Number of recently loaded processed shards retained in RAM.")
+    parser.add_argument(
+        "--shard-cache-size",
+        type=int,
+        default=1,
+        help=(
+            "Number of recently loaded processed shards retained in CPU RAM. "
+            "Use 1 for memory-constrained local runs; raise this on the cluster when RAM allows."
+        ),
+    )
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--epochs", type=int, default=10)
@@ -136,8 +159,18 @@ def parse_args():
         "--cache-model-views",
         action="store_true",
         help=(
-            "Materialize the selected adapter view once for reuse across epochs; "
-            "can reduce repeated view work at the cost of extra memory for ECal-only inputs."
+            "Cache selected adapter views for reuse across epochs. Local in-memory datasets "
+            "are materialized eagerly; sharded datasets use a bounded lazy LRU by default."
+        ),
+    )
+    parser.add_argument(
+        "--model-view-cache-size",
+        type=int,
+        default=None,
+        help=(
+            "Maximum cached model views when --cache-model-views is enabled. "
+            "For sharded datasets, omit to cache roughly --shard-cache-size shard(s); "
+            "use 0 only when you intentionally want an unbounded/all-event view cache."
         ),
     )
     parser.add_argument(
@@ -164,6 +197,8 @@ def validate_args(args):
         value = getattr(args, name)
         if value is not None and value <= 0:
             raise ValueError(f"--{name.replace('_', '-')} must be positive when provided.")
+    if args.model_view_cache_size is not None and args.model_view_cache_size < 0:
+        raise ValueError("--model-view-cache-size must be non-negative when provided.")
     if args.checkpoint_every <= 0 or args.read_step_size < 0:
         raise ValueError("--checkpoint-every must be positive and --read-step-size non-negative.")
     if len(args.valid_labels) < 2 or len(set(args.valid_labels)) != len(args.valid_labels):
@@ -256,6 +291,8 @@ def load_events(args, logger):
         disable_progress=args.no_progress,
         event_log_every=args.event_log_every,
         read_step_size=read_step_size,
+        shard_cache_size=args.shard_cache_size,
+        allow_incomplete_sharded_cache=args.allow_incomplete_sharded_cache,
     )
     if isinstance(events, (ShardedECalTpadDataset, MultiShardedECalTpadDataset)):
         logger.info("Training lazily from ML-ready processed shards: %s", data_dir)
@@ -383,6 +420,96 @@ def model_kwargs_from_args(args, input_dim):
     }
 
 
+def _is_sharded_events(events):
+    return isinstance(events, (ShardedECalTpadDataset, MultiShardedECalTpadDataset))
+
+
+def _largest_reachable_shards(dataset, shard_cache_size):
+    counts = sorted(dataset.shard_event_counts, reverse=True)
+    return sum(counts[: int(shard_cache_size)])
+
+
+def _default_model_view_cache_size(events, args):
+    if args.model_view_cache_size == 0:
+        return None
+    if args.model_view_cache_size is not None:
+        return int(args.model_view_cache_size)
+    if isinstance(events, MultiShardedECalTpadDataset):
+        return max(
+            int(args.batch_size),
+            sum(
+                _largest_reachable_shards(source["dataset"], args.shard_cache_size)
+                for source in events.sources
+            ),
+        )
+    if isinstance(events, ShardedECalTpadDataset):
+        return max(int(args.batch_size), _largest_reachable_shards(events, args.shard_cache_size))
+    return None
+
+
+def prepare_training_views(events, view_fn, args, logger):
+    if not args.cache_model_views:
+        logger.info(
+            "Deriving model-specific views on demand; pass --cache-model-views to reuse them."
+        )
+        return events, view_fn, {"enabled": False, "policy": "on_demand"}
+
+    if _is_sharded_events(events):
+        max_cache_events = _default_model_view_cache_size(events, args)
+        cached_events = CachedEventViewDataset(
+            events,
+            view_fn,
+            max_cache_events=max_cache_events,
+        )
+        logger.info(
+            "Using lazy model-view cache for sharded data: max_cache_events=%s. "
+            "Omit --model-view-cache-size to cache about --shard-cache-size shard(s); "
+            "set it to 0 only for an intentional unbounded cache.",
+            "unbounded" if max_cache_events is None else max_cache_events,
+        )
+        return (
+            cached_events,
+            None,
+            {
+                "enabled": True,
+                "policy": "lazy_lru",
+                "max_cache_events": max_cache_events,
+            },
+        )
+
+    if args.model_view_cache_size not in (None, 0):
+        cached_events = CachedEventViewDataset(
+            events,
+            view_fn,
+            max_cache_events=args.model_view_cache_size,
+        )
+        logger.info(
+            "Using bounded lazy model-view cache: max_cache_events=%s.",
+            args.model_view_cache_size,
+        )
+        return (
+            cached_events,
+            None,
+            {
+                "enabled": True,
+                "policy": "lazy_lru",
+                "max_cache_events": int(args.model_view_cache_size),
+            },
+        )
+
+    training_events = [view_fn(event) for event in events]
+    logger.info("Prepared %s model-specific event views once for epoch reuse.", len(training_events))
+    return (
+        training_events,
+        None,
+        {
+            "enabled": True,
+            "policy": "eager_all_events",
+            "max_cache_events": len(training_events),
+        },
+    )
+
+
 @torch.no_grad()
 def plot_test_predictions(model, events_or_views, test_indices, view_fn, args, device, run_dir):
     model.eval()
@@ -445,17 +572,13 @@ def main():
     model, view_fn = model_and_view(args, input_dim)
     model = model.to(device)
     model_kwargs = model_kwargs_from_args(args, input_dim)
-    training_events = events
-    training_view_fn = view_fn
     logger.info("Input feature dimension: %s", input_dim)
-    if args.cache_model_views:
-        if isinstance(events, (ShardedECalTpadDataset, MultiShardedECalTpadDataset)):
-            logger.warning("--cache-model-views materializes selected sharded events in RAM.")
-        training_events = [view_fn(event) for event in events]
-        training_view_fn = None
-        logger.info("Prepared %s model-specific event views once for epoch reuse.", len(training_events))
-    else:
-        logger.info("Deriving model-specific views on demand; pass --cache-model-views to reuse them.")
+    training_events, training_view_fn, view_cache_info = prepare_training_views(
+        events,
+        view_fn,
+        args,
+        logger,
+    )
     logger.info("Trainable parameters: %s", count_trainable_parameters(model))
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -506,6 +629,7 @@ def main():
         target_order_counts_by_split=target_order_counts_by_split,
         view_fn=view_fn,
         training_view_fn=training_view_fn,
+        view_cache_info=view_cache_info,
         start_epoch=start_epoch,
         best_val_loss=best_val_loss,
     )
@@ -638,6 +762,10 @@ def main():
         test_metrics["test_accuracy"],
         run_dir,
     )
+    if hasattr(events, "cache_info"):
+        logger.info("Final shard cache state: %s", events.cache_info())
+    if hasattr(training_events, "cache_info"):
+        logger.info("Final model-view cache state: %s", training_events.cache_info())
 
 
 if __name__ == "__main__":
