@@ -1,9 +1,13 @@
 """Per-event diagnostics for hit-origin classifier evaluation."""
 
+import itertools
 import math
 
 import torch
 import torch.nn.functional as F
+
+
+TRUTH_MARGIN_BIN_EDGES = (0.0, 0.05, 0.1, 0.25, 0.5, 0.75, 0.999999, 1.000001)
 
 
 def _to_1d_cpu_tensor(value, dtype=None):
@@ -145,6 +149,211 @@ def prediction_metric_summary(
             )
 
     return record
+
+
+def optimal_label_permutation_summary(
+    true_class,
+    pred_class,
+    num_classes=None,
+    energy_weights=None,
+):
+    """Measure event accuracy after the best global relabeling of predictions."""
+    true_class = _to_1d_cpu_tensor(true_class, dtype=torch.long)
+    pred_class = _to_1d_cpu_tensor(pred_class, dtype=torch.long)
+    if true_class is None or pred_class is None or true_class.shape != pred_class.shape:
+        raise ValueError("true_class and pred_class must be aligned one-dimensional vectors.")
+
+    if num_classes is None:
+        nonnegative = torch.cat([true_class[true_class >= 0], pred_class[pred_class >= 0]])
+        num_classes = int(nonnegative.max().item()) + 1 if nonnegative.numel() else 0
+    num_classes = int(num_classes)
+    if num_classes < 1:
+        return {}
+    if num_classes > 8:
+        raise ValueError("Permutation diagnostics are limited to at most eight classes.")
+
+    valid = (
+        (true_class >= 0)
+        & (true_class < num_classes)
+        & (pred_class >= 0)
+        & (pred_class < num_classes)
+    )
+    if not bool(valid.any().item()):
+        return {}
+    true_valid = true_class[valid]
+    pred_valid = pred_class[valid]
+    identity_correct = int((true_valid == pred_valid).sum().item())
+
+    valid_weights = None
+    total_weight = None
+    identity_weight = None
+    weights = _to_1d_cpu_tensor(energy_weights, dtype=torch.float64)
+    if weights is not None and weights.shape == true_class.shape:
+        valid_weights = weights[valid].clamp_min(0.0)
+        total_weight = float(valid_weights.sum().item())
+        if total_weight <= 0.0:
+            valid_weights = None
+            total_weight = None
+        else:
+            identity_weight = float(valid_weights[true_valid == pred_valid].sum().item())
+
+    best_correct = -1
+    best_mapping = tuple(range(num_classes))
+    best_weight = -1.0
+    best_weight_mapping = tuple(range(num_classes))
+    for mapping in itertools.permutations(range(num_classes)):
+        mapping_tensor = torch.tensor(mapping, dtype=torch.long)
+        mapped_prediction = mapping_tensor[pred_valid]
+        correct_mask = true_valid == mapped_prediction
+        correct = int(correct_mask.sum().item())
+        if correct > best_correct:
+            best_correct = correct
+            best_mapping = mapping
+        if valid_weights is not None:
+            correct_weight = float(valid_weights[correct_mask].sum().item())
+            if correct_weight > best_weight:
+                best_weight = correct_weight
+                best_weight_mapping = mapping
+
+    num_valid = int(valid.sum().item())
+    summary = {
+        "permutation_invariant_correct_hits": best_correct,
+        "permutation_invariant_accuracy": best_correct / num_valid,
+        "label_permutation_gain": (best_correct - identity_correct) / num_valid,
+        "optimal_prediction_label_mapping": list(best_mapping),
+        "optimal_prediction_label_mapping_is_identity": best_mapping
+        == tuple(range(num_classes)),
+    }
+
+    if valid_weights is not None:
+        summary.update(
+            {
+                "permutation_invariant_energy_weighted_accuracy": best_weight
+                / total_weight,
+                "energy_weighted_label_permutation_gain": (
+                    best_weight - identity_weight
+                )
+                / total_weight,
+                "optimal_energy_weighted_prediction_label_mapping": list(
+                    best_weight_mapping
+                ),
+                "optimal_energy_weighted_prediction_label_mapping_is_identity": (
+                    best_weight_mapping == tuple(range(num_classes))
+                ),
+            }
+        )
+    return summary
+
+
+def truth_fraction_margin_summary(
+    fraction_target,
+    true_class,
+    pred_class,
+    energy_weights=None,
+    bin_edges=TRUTH_MARGIN_BIN_EDGES,
+):
+    """Summarize how prediction accuracy changes with truth-composition ambiguity."""
+    fractions = _to_2d_cpu_tensor(fraction_target, dtype=torch.float64)
+    true_class = _to_1d_cpu_tensor(true_class, dtype=torch.long)
+    pred_class = _to_1d_cpu_tensor(pred_class, dtype=torch.long)
+    if fractions is None:
+        return {}
+    if (
+        fractions.ndim != 2
+        or fractions.shape[0] != true_class.shape[0]
+        or true_class.shape != pred_class.shape
+        or fractions.shape[1] < 2
+    ):
+        return {}
+
+    finite_rows = torch.isfinite(fractions).all(dim=1)
+    fractions = fractions.clamp_min(0.0)
+    row_sums = fractions.sum(dim=1)
+    valid = finite_rows & (row_sums > 0.0)
+    if not bool(valid.any().item()):
+        return {}
+    normalized = fractions[valid] / row_sums[valid].unsqueeze(1)
+    top_two = normalized.topk(k=2, dim=1).values
+    margins = top_two[:, 0] - top_two[:, 1]
+    correct = true_class[valid] == pred_class[valid]
+
+    edges = torch.as_tensor(bin_edges, dtype=torch.float64)
+    if edges.ndim != 1 or edges.numel() < 2 or not bool((edges[1:] > edges[:-1]).all().item()):
+        raise ValueError("Truth-margin bin edges must be a strictly increasing vector.")
+    bin_index = torch.bucketize(margins, edges[1:-1], right=False)
+    num_bins = int(edges.numel() - 1)
+    total_hits = torch.bincount(bin_index, minlength=num_bins)
+    correct_hits = torch.bincount(bin_index[correct], minlength=num_bins)
+
+    summary = {
+        "truth_fraction_num_valid_hits": int(valid.sum().item()),
+        "mean_truth_dominance_margin": _mean_or_none(margins),
+        "median_truth_dominance_margin": _quantile_or_none(margins, 0.5),
+        "mixed_truth_hit_fraction": float((margins < 0.999999).double().mean().item()),
+        "truth_ambiguous_hit_fraction_margin_le_0p1": float(
+            (margins <= 0.1).double().mean().item()
+        ),
+        "truth_ambiguous_hit_fraction_margin_le_0p25": float(
+            (margins <= 0.25).double().mean().item()
+        ),
+        "truth_ambiguous_hit_fraction_margin_le_0p5": float(
+            (margins <= 0.5).double().mean().item()
+        ),
+        "truth_margin_bin_edges": [float(value) for value in edges.tolist()],
+        "truth_margin_bin_total_hits": [int(value) for value in total_hits.tolist()],
+        "truth_margin_bin_correct_hits": [int(value) for value in correct_hits.tolist()],
+    }
+
+    weights = _to_1d_cpu_tensor(energy_weights, dtype=torch.float64)
+    if weights is not None and weights.shape == true_class.shape:
+        weights = weights[valid].clamp_min(0.0)
+        total_weight = float(weights.sum().item())
+        if total_weight > 0.0:
+            weighted_total = torch.zeros(num_bins, dtype=torch.float64)
+            weighted_correct = torch.zeros(num_bins, dtype=torch.float64)
+            weighted_total.scatter_add_(0, bin_index, weights)
+            weighted_correct.scatter_add_(0, bin_index[correct], weights[correct])
+            summary.update(
+                {
+                    "truth_margin_bin_total_energy": [
+                        float(value) for value in weighted_total.tolist()
+                    ],
+                    "truth_margin_bin_correct_energy": [
+                        float(value) for value in weighted_correct.tolist()
+                    ],
+                    "energy_weighted_mixed_truth_fraction": float(
+                        weights[margins < 0.999999].sum().item()
+                    )
+                    / total_weight,
+                }
+            )
+    return summary
+
+
+def detector_context_summary(view):
+    """Report available TPad context without inventing values for ECal-only views."""
+    if "tpad_mask" not in view and "tpad" not in view:
+        return {}
+    if "tpad_mask" in view:
+        mask = _to_1d_cpu_tensor(view["tpad_mask"], dtype=torch.bool)
+        num_tpad = int(mask.sum().item())
+    else:
+        tpad = _to_2d_cpu_tensor(view.get("tpad"))
+        num_tpad = 0 if tpad is None else int(tpad.shape[0])
+
+    summary = {"num_tpad_tokens": num_tpad}
+    electron_count = view.get("electron_count")
+    if electron_count is not None:
+        electron_count = int(_to_1d_cpu_tensor(electron_count, dtype=torch.long)[0].item())
+        summary.update(
+            {
+                "expected_electron_count": electron_count,
+                "tpad_token_deficit": max(0, electron_count - num_tpad),
+                "tpad_token_excess": max(0, num_tpad - electron_count),
+                "has_complete_tpad_context": num_tpad == electron_count,
+            }
+        )
+    return summary
 
 
 def _centroids_by_label(pos, labels, dims):
@@ -560,6 +769,29 @@ def event_diagnostic_record(
         ),
         "loss": None if loss is None else _finite_float(loss.detach().cpu().item()),
     }
+    num_classes = None
+    if logits is not None:
+        logits_tensor = _to_2d_cpu_tensor(logits)
+        if logits_tensor is not None and logits_tensor.ndim == 2:
+            num_classes = int(logits_tensor.shape[1])
+    record.update(
+        optimal_label_permutation_summary(
+            true_class=true_class,
+            pred_class=pred_class,
+            num_classes=num_classes,
+            energy_weights=energy_weights,
+        )
+    )
+    fraction_target = view.get("origin_id_fraction_target", view.get("fraction_target"))
+    record.update(
+        truth_fraction_margin_summary(
+            fraction_target=fraction_target,
+            true_class=true_class,
+            pred_class=pred_class,
+            energy_weights=energy_weights,
+        )
+    )
+    record.update(detector_context_summary(view))
     record.update(
         geometry_metric_summary(
             view=view,

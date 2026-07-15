@@ -13,6 +13,7 @@ _METADATA_FIELDS = (
     "source_entry",
     "source_label",
     "target_label_order",
+    "origin_id_fraction_label_order",
     "target_class_names",
 )
 _OPTIONAL_TARGET_FIELDS = ("canonical_y", "fraction_target", "origin_id_fraction_target")

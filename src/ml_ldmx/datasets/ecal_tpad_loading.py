@@ -32,6 +32,27 @@ def canonical_axis_from_target_mode(target_mode):
     return None
 
 
+def _fraction_label_order(tensors, fraction_target, fallback_labels):
+    """Resolve the physical-origin label represented by each fraction column."""
+    for key in ("origin_id_fraction_label_order", "target_label_order"):
+        value = tensors.get(key)
+        if value is None:
+            continue
+        if isinstance(value, torch.Tensor):
+            value = value.detach().cpu().reshape(-1).tolist()
+        labels = [int(label) for label in value]
+        if len(labels) == fraction_target.shape[1]:
+            return labels
+
+    fallback_labels = [int(label) for label in fallback_labels]
+    if len(fallback_labels) == fraction_target.shape[1]:
+        return fallback_labels
+    raise ValueError(
+        "Cannot map physical-origin fraction columns to labels: "
+        f"found {fraction_target.shape[1]} columns without a matching stored label order."
+    )
+
+
 def apply_target_mode(tensors, valid_labels, target_mode):
     axis = canonical_axis_from_target_mode(target_mode)
     if axis is None:
@@ -40,7 +61,14 @@ def apply_target_mode(tensors, valid_labels, target_mode):
         return tensors
 
     original_physical_y = tensors["physical_y"].clone()
-    original_fraction_target = tensors["fraction_target"].clone()
+    original_fraction_target = tensors.get(
+        "origin_id_fraction_target", tensors["fraction_target"]
+    ).clone()
+    fraction_label_order = _fraction_label_order(
+        tensors,
+        original_fraction_target,
+        fallback_labels=valid_labels,
+    )
     pos = tensors["ecal_pos"]
     label_means = []
     for label in valid_labels:
@@ -53,11 +81,14 @@ def apply_target_mode(tensors, valid_labels, target_mode):
 
     ordered_labels = [label for label, _mean in sorted(label_means, key=lambda item: (item[1], item[0]))]
     label_to_canonical_class = {label: idx for idx, label in enumerate(ordered_labels)}
-    original_label_to_column = {label: idx for idx, label in enumerate(valid_labels)}
+    original_label_to_column = {
+        label: idx for idx, label in enumerate(fraction_label_order)
+    }
     canonical_columns = [original_label_to_column[label] for label in ordered_labels]
 
     tensors["origin_id_y"] = original_physical_y
     tensors["origin_id_fraction_target"] = original_fraction_target
+    tensors["origin_id_fraction_label_order"] = fraction_label_order
     tensors["y"] = torch.tensor(
         [label_to_canonical_class[int(label)] for label in original_physical_y.tolist()],
         dtype=torch.long,
@@ -82,6 +113,18 @@ def apply_variable_count_target_mode(tensors, valid_labels, target_mode, max_ele
     targets retain their original physical-origin labels in ``origin_id_y`` and
     ``origin_id_fraction_target`` for provenance.
     """
+    original_fraction = None
+    fraction_label_order = None
+    if "fraction_target" in tensors:
+        original_fraction = tensors.get(
+            "origin_id_fraction_target", tensors["fraction_target"]
+        ).clone()
+        fraction_label_order = _fraction_label_order(
+            tensors,
+            original_fraction,
+            fallback_labels=valid_labels,
+        )
+
     noise_mask = tensors.get("is_noise_target")
     if noise_mask is not None:
         noise_mask = noise_mask.to(dtype=torch.bool)
@@ -132,17 +175,12 @@ def apply_variable_count_target_mode(tensors, valid_labels, target_mode, max_ele
     tensors["physical_y"] = model_target
     tensors["target_label_order"] = ordered_labels
 
-    if "fraction_target" in tensors:
-        original_fraction = tensors.get("origin_id_fraction_target", tensors["fraction_target"]).clone()
+    if original_fraction is not None:
         tensors["origin_id_fraction_target"] = original_fraction
-        if original_fraction.shape[1] == max_electrons + 1:
-            original_fraction = original_fraction[:, 1:]
-        if original_fraction.shape[1] != len(valid_labels):
-            raise ValueError(
-                f"Expected {len(valid_labels)} physical-origin fraction columns before canonicalization, "
-                f"got {original_fraction.shape[1]}."
-            )
-        physical_label_to_column = {label: idx for idx, label in enumerate(valid_labels)}
+        tensors["origin_id_fraction_label_order"] = fraction_label_order
+        physical_label_to_column = {
+            label: idx for idx, label in enumerate(fraction_label_order)
+        }
         canonical_fraction = torch.zeros(
             (original_fraction.shape[0], max_electrons),
             dtype=original_fraction.dtype,

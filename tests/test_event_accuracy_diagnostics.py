@@ -6,9 +6,15 @@ import unittest
 import torch
 import torch.nn as nn
 
-from ml_ldmx.eval.event_diagnostics import select_representative_events
+from ml_ldmx.eval.event_diagnostics import (
+    detector_context_summary,
+    optimal_label_permutation_summary,
+    select_representative_events,
+    truth_fraction_margin_summary,
+)
 from ml_ldmx.eval.hit_classifier_baseline import collect_event_metrics
 from ml_ldmx.viz.training import (
+    plot_assignment_ceiling_diagnostics,
     plot_event_accuracy_overview,
     plot_event_diagnostic_correlations,
     plot_shower_separation_profiles,
@@ -44,6 +50,76 @@ def _view(logits, target, event_idx, pos=None, energy=None, fractions=None, elec
 
 
 class EventAccuracyDiagnosticsTest(unittest.TestCase):
+    def test_optimal_label_permutation_recovers_global_class_swap(self):
+        summary = optimal_label_permutation_summary(
+            true_class=torch.tensor([0, 0, 1, 1]),
+            pred_class=torch.tensor([1, 1, 0, 0]),
+            num_classes=2,
+            energy_weights=torch.tensor([4.0, 3.0, 2.0, 1.0]),
+        )
+
+        self.assertEqual(summary["permutation_invariant_correct_hits"], 4)
+        self.assertEqual(summary["permutation_invariant_accuracy"], 1.0)
+        self.assertEqual(summary["label_permutation_gain"], 1.0)
+        self.assertEqual(summary["optimal_prediction_label_mapping"], [1, 0])
+        self.assertFalse(summary["optimal_prediction_label_mapping_is_identity"])
+        self.assertEqual(summary["permutation_invariant_energy_weighted_accuracy"], 1.0)
+
+    def test_energy_weighted_permutation_is_optimized_independently(self):
+        summary = optimal_label_permutation_summary(
+            true_class=torch.tensor([0, 0, 0, 1]),
+            pred_class=torch.tensor([0, 0, 1, 0]),
+            num_classes=2,
+            energy_weights=torch.tensor([1.0, 1.0, 100.0, 100.0]),
+        )
+
+        self.assertEqual(summary["optimal_prediction_label_mapping"], [0, 1])
+        self.assertEqual(
+            summary["optimal_energy_weighted_prediction_label_mapping"],
+            [1, 0],
+        )
+        self.assertAlmostEqual(
+            summary["permutation_invariant_energy_weighted_accuracy"],
+            200.0 / 202.0,
+        )
+
+    def test_truth_fraction_margin_summary_bins_accuracy(self):
+        summary = truth_fraction_margin_summary(
+            fraction_target=torch.tensor(
+                [
+                    [0.51, 0.49],
+                    [0.60, 0.40],
+                    [0.90, 0.10],
+                    [1.00, 0.00],
+                ]
+            ),
+            true_class=torch.tensor([0, 0, 0, 0]),
+            pred_class=torch.tensor([1, 0, 0, 0]),
+            energy_weights=torch.tensor([1.0, 2.0, 3.0, 4.0]),
+        )
+
+        self.assertEqual(summary["truth_fraction_num_valid_hits"], 4)
+        self.assertAlmostEqual(summary["mean_truth_dominance_margin"], 0.505)
+        self.assertAlmostEqual(summary["truth_ambiguous_hit_fraction_margin_le_0p1"], 0.25)
+        self.assertAlmostEqual(summary["truth_ambiguous_hit_fraction_margin_le_0p25"], 0.5)
+        self.assertEqual(sum(summary["truth_margin_bin_total_hits"]), 4)
+        self.assertEqual(sum(summary["truth_margin_bin_correct_hits"]), 3)
+        self.assertAlmostEqual(sum(summary["truth_margin_bin_total_energy"]), 10.0)
+        self.assertAlmostEqual(sum(summary["truth_margin_bin_correct_energy"]), 9.0)
+
+    def test_detector_context_summary_reports_missing_tracks(self):
+        summary = detector_context_summary(
+            {
+                "tpad_mask": torch.tensor([False, True, False, True]),
+                "electron_count": torch.tensor(3),
+            }
+        )
+
+        self.assertEqual(summary["num_tpad_tokens"], 2)
+        self.assertEqual(summary["tpad_token_deficit"], 1)
+        self.assertEqual(summary["tpad_token_excess"], 0)
+        self.assertFalse(summary["has_complete_tpad_context"])
+
     def test_collect_event_metrics_reports_per_event_accuracy(self):
         events = [
             _view(
@@ -318,6 +394,40 @@ class EventAccuracyDiagnosticsTest(unittest.TestCase):
                 "shower separation",
                 num_bins=3,
                 bootstrap_samples=10,
+            )
+
+            self.assertTrue(plotted)
+            self.assertTrue(output_path.exists())
+            self.assertGreater(output_path.stat().st_size, 0)
+
+    def test_plot_assignment_ceiling_diagnostics_writes_file(self):
+        records = []
+        edges = [0.0, 0.1, 0.5, 1.000001]
+        for event_idx in range(6):
+            records.append(
+                {
+                    "event_idx": event_idx,
+                    "num_hits": 10,
+                    "correct_hits": 5 + event_idx,
+                    "accuracy": (5 + event_idx) / 10,
+                    "permutation_invariant_correct_hits": 7 + event_idx // 2,
+                    "permutation_invariant_accuracy": (7 + event_idx // 2) / 10,
+                    "label_permutation_gain": (2 - event_idx // 2) / 10,
+                    "truth_margin_bin_edges": edges,
+                    "truth_margin_bin_total_hits": [2, 3, 5],
+                    "truth_margin_bin_correct_hits": [1, 2, 4],
+                    "truth_margin_bin_total_energy": [1.0, 2.0, 7.0],
+                    "truth_margin_bin_correct_energy": [0.5, 1.5, 6.5],
+                    "tpad_token_deficit": event_idx % 2,
+                }
+            )
+
+        with TemporaryDirectory() as temporary_dir:
+            output_path = Path(temporary_dir) / "assignment_ceiling.png"
+            plotted = plot_assignment_ceiling_diagnostics(
+                records,
+                output_path,
+                "assignment ceiling",
             )
 
             self.assertTrue(plotted)

@@ -60,6 +60,7 @@ from ml_ldmx.viz.ecal import (
     plot_ecal_hit_prediction_errors_3d_interactive,
 )
 from ml_ldmx.viz.training import (
+    plot_assignment_ceiling_diagnostics,
     plot_confusion_matrix,
     plot_event_accuracy_overview,
     plot_event_diagnostic_correlations,
@@ -996,6 +997,12 @@ def main():
         val_diagnostic_plot_path,
         f"{args.model} validation event diagnostics",
     )
+    val_ceiling_plot_path = run_dir / "val_assignment_ceiling_diagnostics.png"
+    plot_assignment_ceiling_diagnostics(
+        val_event_records,
+        val_ceiling_plot_path,
+        f"{args.model} validation assignment-ceiling diagnostics",
+    )
     val_separation_plot_path = run_dir / "val_shower_separation_profiles.png"
     plot_shower_separation_profiles(
         val_event_records,
@@ -1026,6 +1033,10 @@ def main():
         logger.info(
             "Skipped validation diagnostic-correlation plot; need at least two finite events per panel."
         )
+    if val_ceiling_plot_path.exists():
+        validation_plot_paths.append(val_ceiling_plot_path)
+    else:
+        logger.info("Skipped validation assignment-ceiling plot; required diagnostics are unavailable.")
     if val_separation_plot_path.exists():
         validation_plot_paths.append(val_separation_plot_path)
     else:

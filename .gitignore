@@ -58,7 +58,7 @@ other/outputs/
 *.slcio
 
 data/
-models/
+/models/
 *.pt
 
 # =========================

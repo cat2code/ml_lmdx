@@ -219,6 +219,23 @@ inputs. This keeps energy-weighted diagnostics physically interpretable and
 leaves the TriggerPad signal available for future diagnostics. Existing caches
 remain supported and use their stored input-energy vector as a fallback.
 
+### Assignment Ceilings and TPad Ablation
+
+Analyze a saved best checkpoint without retraining:
+
+```bash
+python scripts/analyze_hit_classifier_ceiling.py \
+  --run-dir outputs/hit_classifier_baseline/my_run \
+  --checkpoint best.pt \
+  --split val \
+  --device auto
+```
+
+The command writes ordinary versus permutation-invariant accuracy, accuracy
+versus truth deposited-energy fraction margin, TPad completeness summaries,
+and a paired evaluation with every TPad token removed. It preserves the exact
+saved event split and model preprocessing.
+
 ### Pipeline Benchmarking
 
 Measure local IO, adapter, and representative forward/backward throughput
