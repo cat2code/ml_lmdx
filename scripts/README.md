@@ -10,7 +10,8 @@ should not become the place where maintained features are implemented.
 ## Tensorize the 10M 2e and 10M 3e ROOT datasets on Slurm
 
 The input directories are supplied at submission time. Each ROOT file becomes
-one `.pt` shard, and at most `MAX_PARALLEL_JOBS` files run concurrently.
+one `.pt` shard. The launcher creates a fixed pool of `MAX_PARALLEL_JOBS` Slurm
+workers; each worker processes several ROOT files sequentially.
 
 ```bash
 cd /cluster/path/to/ml_ldmx
@@ -36,17 +37,12 @@ squeue -u "$USER"
 tail -F outputs/slurm/ml_ldmx_tensorize_JOB_ID.out
 ```
 
-The dispatcher runs the test suite and a real-ROOT smoke test, reads Slurm's
-`MaxArraySize`, and splits large plans into sequential worker-array chunks when
-needed. Local array indices are translated back to global plan indices, so plans
-with more ROOT files than Slurm permits in one array are supported while
-`MAX_PARALLEL_JOBS` remains the overall concurrency limit. A dependent finalizer
-runs after the last chunk. It requires exactly 10,000,000 events for each class
+The dispatcher freezes the ordered ROOT-file plan, submits one fixed-size worker
+array, and submits a dependent finalizer. For example, 3,003 ROOT files with
+`MAX_PARALLEL_JOBS=100` use only 100 Slurm jobs, with about 30 files handled by
+each worker. Unit and smoke tests are deliberately separate from this production
+launcher. The finalizer requires exactly 10,000,000 events for each class
 (20,000,000 total) and writes:
-
-If a compute node cannot query `MaxArraySize`, the dispatcher uses a conservative
-1,000-task fallback. Set `MAX_ARRAY_SIZE` explicitly to use a known cluster limit;
-Cosmos currently reports `MAX_ARRAY_SIZE=2001`.
 
 ```text
 data/processed/production_10M_001_sharded/2e/events/{manifest.json,index.json,shards/*.pt}

@@ -12,14 +12,11 @@ MODE="${MODE:-dispatch}"
 REPO_DIR="${REPO_DIR:-${SLURM_SUBMIT_DIR:-$PWD}}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${REPO_DIR}/data/processed/production_10M_001_sharded}"
 PLAN_FILE="${PLAN_FILE:-}"
-TASK_INDEX_OFFSET="${TASK_INDEX_OFFSET:-0}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 READ_STEP_SIZE="${READ_STEP_SIZE:-500}"
 ECAL_ENERGY_TRANSFORM="${ECAL_ENERGY_TRANSFORM:-log1p}"
 TPAD_PE_TRANSFORM="${TPAD_PE_TRANSFORM:-log1p}"
 MAX_PARALLEL_JOBS="${MAX_PARALLEL_JOBS:-100}"
-MAX_ARRAY_SIZE="${MAX_ARRAY_SIZE:-}"
-MAX_ARRAY_SIZE_FALLBACK="${MAX_ARRAY_SIZE_FALLBACK:-1000}"
 CPUS_PER_WORKER="${CPUS_PER_WORKER:-1}"
 MEM_PER_WORKER="${MEM_PER_WORKER:-32G}"
 WORKER_TIME="${WORKER_TIME:-24:00:00}"
@@ -27,7 +24,6 @@ FINALIZER_MEM="${FINALIZER_MEM:-16G}"
 FINALIZER_TIME="${FINALIZER_TIME:-04:00:00}"
 EXPECTED_EVENTS_2E="${EXPECTED_EVENTS_2E:-10000000}"
 EXPECTED_EVENTS_3E="${EXPECTED_EVENTS_3E:-10000000}"
-RUN_TESTS="${RUN_TESTS:-1}"
 FULL_VALIDATE="${FULL_VALIDATE:-0}"
 ALLOW_FAILED_ROOT_FILES="${ALLOW_FAILED_ROOT_FILES:-0}"
 FORCE="${FORCE:-0}"
@@ -97,17 +93,6 @@ dispatch() {
   echo "TPad transform:   ${TPAD_PE_TRANSFORM}"
   echo "Expected events:  2e=${EXPECTED_EVENTS_2E}, 3e=${EXPECTED_EVENTS_3E}"
 
-  if [[ "${RUN_TESTS}" == "1" ]]; then
-    echo "Running the Python test suite..."
-    "${PYTHON_BIN}" -m unittest discover -s tests
-    echo "Running the ROOT-backed tensorization/reader/training smoke test..."
-    ML_LDMX_ROOT_2E_DIR="${ROOT_2E_DIR}" \
-      ML_LDMX_ROOT_3E_DIR="${ROOT_3E_DIR}" \
-      ML_LDMX_ECAL_ENERGY_TRANSFORM="${ECAL_ENERGY_TRANSFORM}" \
-      ML_LDMX_TPAD_PE_TRANSFORM="${TPAD_PE_TRANSFORM}" \
-      "${PYTHON_BIN}" -m unittest discover -s tests -p test_sharded_cache_smoke.py
-  fi
-
   "${PYTHON_BIN}" -u scripts/preprocess_ecal_tpad_array.py plan \
     --plan-file "${PLAN_FILE}" \
     --output-root "${OUTPUT_ROOT}" \
@@ -116,87 +101,44 @@ dispatch() {
     --ecal-energy-transform "${ECAL_ENERGY_TRANSFORM}" \
     --tpad-pe-transform "${TPAD_PE_TRANSFORM}"
 
-  local task_count max_array_size array_count
+  local task_count worker_count last_worker
   task_count=$("${PYTHON_BIN}" scripts/preprocess_ecal_tpad_array.py count --plan-file "${PLAN_FILE}")
   [[ "${task_count}" =~ ^[1-9][0-9]*$ ]] || fail "The plan contains no worker tasks."
+  worker_count="${MAX_PARALLEL_JOBS}"
+  if ((worker_count > task_count)); then
+    worker_count="${task_count}"
+  fi
+  last_worker=$((worker_count - 1))
   echo "Frozen plan:      ${PLAN_FILE}"
-  echo "Array tasks:      ${task_count}"
+  echo "ROOT-file tasks:  ${task_count}"
+  echo "Slurm workers:    ${worker_count}"
 
   if [[ "${DRY_RUN}" == "1" ]]; then
-    echo "DRY_RUN=1: plan and tests succeeded; no Slurm workers were submitted."
+    echo "DRY_RUN=1: plan succeeded; no Slurm workers were submitted."
     return
   fi
 
-  if [[ -n "${MAX_ARRAY_SIZE}" ]]; then
-    [[ "${MAX_ARRAY_SIZE}" =~ ^[1-9][0-9]*$ ]] || fail "MAX_ARRAY_SIZE must be a positive integer."
-    max_array_size="${MAX_ARRAY_SIZE}"
-  else
-    if ! max_array_size=$(scontrol show config 2>/dev/null | awk '$1 == "MaxArraySize" {print $3; exit}'); then
-      max_array_size=""
-    fi
-    if [[ ! "${max_array_size}" =~ ^[1-9][0-9]*$ ]]; then
-      [[ "${MAX_ARRAY_SIZE_FALLBACK}" =~ ^[1-9][0-9]*$ ]] || \
-        fail "MAX_ARRAY_SIZE_FALLBACK must be a positive integer."
-      max_array_size="${MAX_ARRAY_SIZE_FALLBACK}"
-      echo "WARNING: Slurm MaxArraySize is unavailable; using safe fallback ${max_array_size}."
-    fi
-  fi
-  array_count=$(((task_count + max_array_size - 1) / max_array_size))
-  echo "Slurm array limit: ${max_array_size} task(s) per array"
-  echo "Worker arrays:     ${array_count} sequential chunk(s)"
-
   local worker_submission worker_job_id finalizer_submission finalizer_job_id
-  local previous_worker_job_id=""
-  local task_offset=0
-  local chunk_number=1
-  local chunk_task_count chunk_last_task task_stop
-  local -a worker_sbatch_args worker_job_ids
-  worker_job_ids=()
-
-  while ((task_offset < task_count)); do
-    chunk_task_count=$((task_count - task_offset))
-    if ((chunk_task_count > max_array_size)); then
-      chunk_task_count="${max_array_size}"
-    fi
-    chunk_last_task=$((chunk_task_count - 1))
-    task_stop=$((task_offset + chunk_task_count - 1))
-    worker_sbatch_args=(
-      --parsable
-      --export=ALL
-      --job-name=ml_ldmx_tensor_worker
-    )
-    if [[ -n "${previous_worker_job_id}" ]]; then
-      worker_sbatch_args+=(--dependency="afterany:${previous_worker_job_id}")
-    fi
-    worker_sbatch_args+=(
-      --array="0-${chunk_last_task}%${MAX_PARALLEL_JOBS}"
-      --cpus-per-task="${CPUS_PER_WORKER}"
-      --mem="${MEM_PER_WORKER}"
-      --time="${WORKER_TIME}"
-      --output="${REPO_DIR}/outputs/slurm/%x_%A_%a.out"
-      --error="${REPO_DIR}/outputs/slurm/%x_%A_%a.err"
-    )
-
-    worker_submission=$(
-      MODE=worker PLAN_FILE="${PLAN_FILE}" REPO_DIR="${REPO_DIR}" OUTPUT_ROOT="${OUTPUT_ROOT}" \
-        TASK_INDEX_OFFSET="${task_offset}" \
-        sbatch "${worker_sbatch_args[@]}" \
-          "${REPO_DIR}/scripts/sbatch/preprocess_production_5M_001_sharded.sbatch"
-    )
-    worker_job_id="${worker_submission%%;*}"
-    worker_job_ids+=("${worker_job_id}")
-    echo "Worker array job ${chunk_number}/${array_count}: ${worker_job_id} (plan tasks ${task_offset}-${task_stop})"
-
-    previous_worker_job_id="${worker_job_id}"
-    task_offset=$((task_stop + 1))
-    chunk_number=$((chunk_number + 1))
-  done
+  worker_submission=$(
+    MODE=worker PLAN_FILE="${PLAN_FILE}" REPO_DIR="${REPO_DIR}" OUTPUT_ROOT="${OUTPUT_ROOT}" \
+      TASK_COUNT="${task_count}" WORKER_COUNT="${worker_count}" \
+      sbatch --parsable --export=ALL \
+      --job-name=ml_ldmx_tensor_worker \
+      --array="0-${last_worker}" \
+      --cpus-per-task="${CPUS_PER_WORKER}" \
+      --mem="${MEM_PER_WORKER}" \
+      --time="${WORKER_TIME}" \
+      --output="${REPO_DIR}/outputs/slurm/%x_%A_%a.out" \
+      --error="${REPO_DIR}/outputs/slurm/%x_%A_%a.err" \
+      "${REPO_DIR}/scripts/sbatch/preprocess_production_5M_001_sharded.sbatch"
+  )
+  worker_job_id="${worker_submission%%;*}"
 
   finalizer_submission=$(
     MODE=finalize PLAN_FILE="${PLAN_FILE}" REPO_DIR="${REPO_DIR}" OUTPUT_ROOT="${OUTPUT_ROOT}" \
       sbatch --parsable --export=ALL \
       --job-name=ml_ldmx_tensor_finalize \
-      --dependency="afterany:${previous_worker_job_id}" \
+      --dependency="afterany:${worker_job_id}" \
       --cpus-per-task=1 \
       --mem="${FINALIZER_MEM}" \
       --time="${FINALIZER_TIME}" \
@@ -206,27 +148,32 @@ dispatch() {
   )
   finalizer_job_id="${finalizer_submission%%;*}"
 
-  local worker_job_list
-  worker_job_list=$(IFS=,; echo "${worker_job_ids[*]}")
-  echo "Worker array jobs: ${worker_job_list}"
+  echo "Worker array job: ${worker_job_id}"
   echo "Finalizer job:    ${finalizer_job_id}"
-  echo "Track all:        squeue -j ${worker_job_list},${finalizer_job_id}"
+  echo "Track both:       squeue -j ${worker_job_id},${finalizer_job_id}"
 }
 
 run_worker() {
   [[ -n "${PLAN_FILE}" ]] || fail "Worker received no PLAN_FILE."
   [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]] || fail "Worker received no SLURM_ARRAY_TASK_ID."
-  [[ "${TASK_INDEX_OFFSET}" =~ ^[0-9]+$ ]] || fail "TASK_INDEX_OFFSET must be a non-negative integer."
+  [[ "${TASK_COUNT:-}" =~ ^[1-9][0-9]*$ ]] || fail "Worker received an invalid TASK_COUNT."
+  [[ "${WORKER_COUNT:-}" =~ ^[1-9][0-9]*$ ]] || fail "Worker received an invalid WORKER_COUNT."
   setup_environment
-  local task_index=$((TASK_INDEX_OFFSET + SLURM_ARRAY_TASK_ID))
-  local worker_args=(
-    scripts/preprocess_ecal_tpad_array.py worker
-    --plan-file "${PLAN_FILE}"
-    --task-index "${task_index}"
-    --read-step-size "${READ_STEP_SIZE}"
-  )
-  [[ "${FORCE}" == "1" ]] && worker_args+=(--force)
-  "${PYTHON_BIN}" -u "${worker_args[@]}"
+  local task_index failures=0
+  local -a worker_args
+  for ((task_index = SLURM_ARRAY_TASK_ID; task_index < TASK_COUNT; task_index += WORKER_COUNT)); do
+    worker_args=(
+      scripts/preprocess_ecal_tpad_array.py worker
+      --plan-file "${PLAN_FILE}"
+      --task-index "${task_index}"
+      --read-step-size "${READ_STEP_SIZE}"
+    )
+    [[ "${FORCE}" == "1" ]] && worker_args+=(--force)
+    if ! "${PYTHON_BIN}" -u "${worker_args[@]}"; then
+      failures=$((failures + 1))
+    fi
+  done
+  ((failures == 0)) || fail "Worker ${SLURM_ARRAY_TASK_ID} failed ${failures} ROOT-file task(s)."
 }
 
 finalize() {
