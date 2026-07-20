@@ -19,6 +19,7 @@ ECAL_ENERGY_TRANSFORM="${ECAL_ENERGY_TRANSFORM:-log1p}"
 TPAD_PE_TRANSFORM="${TPAD_PE_TRANSFORM:-log1p}"
 MAX_PARALLEL_JOBS="${MAX_PARALLEL_JOBS:-100}"
 MAX_ARRAY_SIZE="${MAX_ARRAY_SIZE:-}"
+MAX_ARRAY_SIZE_FALLBACK="${MAX_ARRAY_SIZE_FALLBACK:-1000}"
 CPUS_PER_WORKER="${CPUS_PER_WORKER:-1}"
 MEM_PER_WORKER="${MEM_PER_WORKER:-32G}"
 WORKER_TIME="${WORKER_TIME:-24:00:00}"
@@ -127,12 +128,19 @@ dispatch() {
   fi
 
   if [[ -n "${MAX_ARRAY_SIZE}" ]]; then
+    [[ "${MAX_ARRAY_SIZE}" =~ ^[1-9][0-9]*$ ]] || fail "MAX_ARRAY_SIZE must be a positive integer."
     max_array_size="${MAX_ARRAY_SIZE}"
   else
-    max_array_size=$(scontrol show config 2>/dev/null | awk '$1 == "MaxArraySize" {print $3; exit}')
+    if ! max_array_size=$(scontrol show config 2>/dev/null | awk '$1 == "MaxArraySize" {print $3; exit}'); then
+      max_array_size=""
+    fi
+    if [[ ! "${max_array_size}" =~ ^[1-9][0-9]*$ ]]; then
+      [[ "${MAX_ARRAY_SIZE_FALLBACK}" =~ ^[1-9][0-9]*$ ]] || \
+        fail "MAX_ARRAY_SIZE_FALLBACK must be a positive integer."
+      max_array_size="${MAX_ARRAY_SIZE_FALLBACK}"
+      echo "WARNING: Slurm MaxArraySize is unavailable; using safe fallback ${max_array_size}."
+    fi
   fi
-  [[ "${max_array_size}" =~ ^[1-9][0-9]*$ ]] || \
-    fail "Could not determine Slurm MaxArraySize. Set MAX_ARRAY_SIZE to a positive integer."
   array_count=$(((task_count + max_array_size - 1) / max_array_size))
   echo "Slurm array limit: ${max_array_size} task(s) per array"
   echo "Worker arrays:     ${array_count} sequential chunk(s)"

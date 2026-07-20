@@ -44,6 +44,10 @@ with more ROOT files than Slurm permits in one array are supported while
 runs after the last chunk. It requires exactly 10,000,000 events for each class
 (20,000,000 total) and writes:
 
+If a compute node cannot query `MaxArraySize`, the dispatcher uses a conservative
+1,000-task fallback. Set `MAX_ARRAY_SIZE` explicitly to use a known cluster limit;
+Cosmos currently reports `MAX_ARRAY_SIZE=2001`.
+
 ```text
 data/processed/production_10M_001_sharded/2e/events/{manifest.json,index.json,shards/*.pt}
 data/processed/production_10M_001_sharded/3e/events/{manifest.json,index.json,shards/*.pt}
