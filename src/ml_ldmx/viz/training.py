@@ -70,13 +70,10 @@ def plot_confusion_matrix(confusion, valid_labels, output_path, title):
 
 
 def plot_event_accuracy_overview(records, output_path, title, annotate_worst=8):
-    """Plot per-event hit accuracy across one validation/test split."""
+    """Plot the per-event hit-accuracy distribution for one data split."""
     if not records:
         return
 
-    records = sorted(records, key=lambda record: record.get("split_position", record["event_idx"]))
-    positions = np.array([record.get("split_position", idx) for idx, record in enumerate(records)])
-    event_indices = np.array([record["event_idx"] for record in records])
     accuracies = np.array(
         [
             np.nan if record.get("accuracy") is None else float(record["accuracy"])
@@ -84,74 +81,49 @@ def plot_event_accuracy_overview(records, output_path, title, annotate_worst=8):
         ],
         dtype=float,
     )
-    num_hits = np.array([int(record.get("num_hits", 0)) for record in records], dtype=float)
-    incorrect_hits = np.array([int(record.get("incorrect_hits", 0)) for record in records], dtype=float)
     valid = np.isfinite(accuracies)
     if not bool(valid.any()):
         return
 
-    mean_accuracy = float(np.nanmean(accuracies))
-    median_accuracy = float(np.nanmedian(accuracies))
-    min_accuracy = float(np.nanmin(accuracies))
-    marker_sizes = np.clip(18.0 + np.sqrt(np.clip(num_hits, 0, None)) * 2.0, 18.0, 120.0)
-
-    fig, (ax_scatter, ax_hist) = plt.subplots(
-        2,
-        1,
-        figsize=(11, 8),
-        gridspec_kw={"height_ratios": [3.0, 1.2]},
-    )
-    scatter = ax_scatter.scatter(
-        positions[valid],
-        accuracies[valid],
-        c=incorrect_hits[valid],
-        s=marker_sizes[valid],
-        cmap="Reds",
-        alpha=0.82,
-        edgecolors="#1f2933",
-        linewidths=0.25,
-    )
-    ax_scatter.axhline(mean_accuracy, color="#1f77b4", linewidth=1.2, label=f"mean {mean_accuracy:.3f}")
-    ax_scatter.axhline(
-        median_accuracy,
-        color="#2ca02c",
-        linewidth=1.2,
-        linestyle="--",
-        label=f"median {median_accuracy:.3f}",
-    )
-    ax_scatter.set_ylim(-0.03, 1.03)
-    ax_scatter.set_xlabel("event position in split")
-    ax_scatter.set_ylabel("hit accuracy")
-    ax_scatter.set_title(
-        f"{title}\n"
-        f"events={int(valid.sum())}, mean={mean_accuracy:.3f}, "
-        f"median={median_accuracy:.3f}, min={min_accuracy:.3f}"
-    )
-    ax_scatter.grid(True, alpha=0.25)
-    ax_scatter.legend(loc="lower right")
-    colorbar = fig.colorbar(scatter, ax=ax_scatter, pad=0.01)
-    colorbar.set_label("incorrect hits")
-
-    worst_order = np.lexsort((-incorrect_hits[valid], accuracies[valid]))
-    valid_positions = positions[valid]
     valid_accuracies = accuracies[valid]
-    valid_event_indices = event_indices[valid]
-    for order_idx in worst_order[: max(0, int(annotate_worst))]:
-        ax_scatter.annotate(
-            str(int(valid_event_indices[order_idx])),
-            xy=(valid_positions[order_idx], valid_accuracies[order_idx]),
-            xytext=(3, 5),
-            textcoords="offset points",
-            fontsize=7,
-            color="#7f1d1d",
-        )
+    mean_accuracy = float(np.mean(valid_accuracies))
+    median_accuracy = float(np.median(valid_accuracies))
+    min_accuracy = float(np.min(valid_accuracies))
+    max_accuracy = float(np.max(valid_accuracies))
 
-    bins = np.linspace(0.0, 1.0, 21)
-    ax_hist.hist(accuracies[valid], bins=bins, color="#4c78a8", alpha=0.8)
-    ax_hist.set_xlim(0, 1)
+    # Retain the old argument for callers that used the former scatter-panel API.
+    _ = annotate_worst
+
+    fig, ax_hist = plt.subplots(figsize=(10, 5.5))
+    # One percentage-point bins expose substantially more structure than the
+    # former five percentage-point bins while remaining legible for 1k--3k events.
+    bins = np.linspace(0.0, 1.0, 101)
+    ax_hist.hist(
+        valid_accuracies,
+        bins=bins,
+        color="#4c78a8",
+        alpha=0.88,
+        edgecolor="white",
+        linewidth=0.35,
+    )
+    ax_hist.axvline(
+        mean_accuracy,
+        color="#d62728",
+        linewidth=2.0,
+        label=f"mean = {mean_accuracy:.3f}",
+    )
+    ax_hist.set_xlim(0.0, 1.0)
+    ax_hist.set_xticks(np.linspace(0.0, 1.0, 11))
     ax_hist.set_xlabel("event hit accuracy")
     ax_hist.set_ylabel("events")
-    ax_hist.grid(True, alpha=0.25)
+    ax_hist.set_title(
+        f"{title}\n"
+        f"events={int(valid.sum()):,}, mean={mean_accuracy:.3f}, "
+        f"median={median_accuracy:.3f}, min={min_accuracy:.3f}, "
+        f"max={max_accuracy:.3f}"
+    )
+    ax_hist.grid(axis="y", alpha=0.25)
+    ax_hist.legend(loc="upper left")
 
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -653,8 +625,12 @@ def plot_shower_separation_profiles(
     num_bins=8,
     bootstrap_samples=200,
     seed=7,
+    include_first_three_layers=False,
 ):
-    """Plot accuracy against shower separation for each event multiplicity."""
+    """Plot accuracy against shower separation for each event multiplicity.
+
+    Set ``include_first_three_layers`` to true for an first-3-layers and all-layers figure.
+    """
     metric_specs = (
         (
             "contributor_min_normalized_shower_separation_xy",
@@ -681,6 +657,10 @@ def plot_shower_separation_profiles(
             "--",
         ),
     )
+    if not include_first_three_layers:
+        metric_specs = tuple(
+            spec for spec in metric_specs if not spec[0].startswith("early_")
+        )
     target_specs = (
         ("accuracy", "event hit accuracy"),
         ("energy_weighted_accuracy", "event energy-weighted accuracy"),

@@ -400,6 +400,20 @@ class EventAccuracyDiagnosticsTest(unittest.TestCase):
             self.assertTrue(output_path.exists())
             self.assertGreater(output_path.stat().st_size, 0)
 
+            all_layers_path = Path(temporary_dir) / "separation_profiles_all_layers.png"
+            plotted = plot_shower_separation_profiles(
+                records,
+                all_layers_path,
+                "all-layer shower separation",
+                num_bins=3,
+                bootstrap_samples=10,
+                include_first_three_layers=False,
+            )
+
+            self.assertTrue(plotted)
+            self.assertTrue(all_layers_path.exists())
+            self.assertGreater(all_layers_path.stat().st_size, 0)
+
     def test_plot_assignment_ceiling_diagnostics_writes_file(self):
         records = []
         edges = [0.0, 0.1, 0.5, 1.000001]
